@@ -8,13 +8,48 @@ from typing import Optional
 from pathlib import Path
 import random
 import time
+import json
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 import torch
 from torch.optim import AdamW
 from tqdm import tqdm
 
+
 from game import Game2048, Direction, GameMLP, MLPConfig
 
 app = typer.Typer(help="Train and evaluate 2048 AI agents")
+
+
+def format_grid(grid: list[list[int]], indent: str = "  ") -> str:
+    """
+    Format a 2048 grid for pretty printing.
+    Grid contains exponents (0 = empty, 1 = 2, 2 = 4, etc.)
+    """
+    lines = []
+    # Find max width needed for any cell
+    max_val = max(2**cell if cell > 0 else 0 for row in grid for cell in row)
+    cell_width = max(4, len(str(max_val)) + 1)
+
+    # Top border
+    lines.append(indent + "┌" + "─" * (cell_width * 4 + 3) + "┐")
+
+    for i, row in enumerate(grid):
+        cells = []
+        for cell in row:
+            if cell == 0:
+                cells.append(".".center(cell_width))
+            else:
+                cells.append(str(2**cell).center(cell_width))
+        lines.append(indent + "│" + "│".join(cells) + "│")
+        if i < 3:
+            lines.append(indent + "├" + "─" * (cell_width * 4 + 3) + "┤")
+
+    # Bottom border
+    lines.append(indent + "└" + "─" * (cell_width * 4 + 3) + "┘")
+
+    return "\n".join(lines)
 
 
 @torch.no_grad
@@ -53,6 +88,9 @@ def play_game_for_episode(
             possible_gains.items(), key=lambda item: item[1]
         )
 
+        # capture grid state before the move (for visualization)
+        state_before = [row[:] for row in game.grid]
+
         # now agent makes a decision
         model_input = game.to_model_format()
         if device is not None:
@@ -74,6 +112,10 @@ def play_game_for_episode(
         )  # this is the one we want to save
         selected_action = torch.multinomial(adjusted_action_dist, num_samples=1).item()
         action: Direction = model.directions[selected_action]
+
+        # compute entropy of the action distribution (model's uncertainty)
+        valid_probs = adjusted_action_dist[adjusted_action_dist > 0]
+        step_entropy = -(valid_probs * valid_probs.log()).sum().item()
 
         # take step
         new_state, points_earned, done, info = game.step(action)
@@ -98,11 +140,25 @@ def play_game_for_episode(
         # and then this determines which action was actually selected
         step_data["selected_direction"] = selected_action
         step_data["game_state"] = model_input
-        # step_data["reward"] = step_reward
+        step_data["state_before"] = state_before  # raw grid before move
+        step_data["result_state"] = new_state  # state after the move
         step_data["max_points_possible"] = highest_points
         step_data["points_earned"] = points_earned
         step_data["points_possible"] = possible_gains
         step_data["action_mask"] = invalid_mask
+        step_data["smoothness_delta"] = info.get("smoothness_delta", 0.0)
+        step_data["max_tile_created"] = info.get("max_tile_created", 0)
+        step_data["max_exponent_before"] = info.get("max_exponent_before", 0)
+        step_data["max_exponent_after"] = info.get("max_exponent_after", 0)
+        step_data["corner_delta"] = info.get("corner_delta", 0.0)
+        step_data["adjacency_delta"] = info.get("adjacency_delta", 0.0)
+        step_data["chain_delta"] = info.get("chain_delta", 0.0)
+        step_data["topological_delta"] = info.get("topological_delta", 0.0)
+        step_data["topological_anchor"] = info.get("topological_anchor")
+        step_data["entropy"] = step_entropy
+
+        # save the data generated at the current step
+        game_data.append(step_data)
 
         # we dont want to save the terminal state as part of the rollout, since all possible actions would be masked
         # and unless our initial training run results in a perfect model (highly unlikely) we dont need to worry about
@@ -110,17 +166,29 @@ def play_game_for_episode(
         if done:
             break  # the `step` variable is `1-indexed` so the final step isn't incremented
 
-        # save the data generated at the current step
-        game_data.append(step_data)
         step += 1
 
     # add the rollout data
     episode_data = {
         "moves": game_data,
-        "total_points": points_earned,
+        "total_points": total_points,
         "total_steps": step,
+        "final_state": new_state,  # Store the final grid for logging
     }
     return episode_data
+
+
+def _worker_play_game(args: tuple) -> dict:
+    """
+    Worker function for multiprocessing.
+    Reconstructs model from state dict and plays a game.
+    """
+    state_dict, config_dict, max_steps = args
+    config = MLPConfig(**config_dict)
+    model = GameMLP(config)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return play_game_for_episode(model, max_steps=max_steps, device=None)
 
 
 def model_optimize_step(
@@ -242,35 +310,70 @@ def model_optimize_step(
     # typer.echo(f"  Number of batches: {len(batches)}")
 
 
-def calculate_advantage(episodes: list[dict], gamma: float):
+def calculate_advantage(
+    episodes: list[dict],
+    gamma: float,
+    points_weight: float = 1.0,
+    smoothness_weight: float = 1.0,
+    max_tile_weight: float = 1.0,
+    corner_weight: float = 1.0,
+    adjacency_weight: float = 1.0,
+    chain_weight: float = 1.0,
+    topological_weight: float = 1.0,
+    win_bonus: float = 1000.0,
+):
     """
-    One thing that I also want to try is looking at the step-level reward
-    and using harmonic mean to figure out how good most of the actions are.
-    For example if the model had a chance to make a good merge but didn't then
-    this should be penalized heavily
-    """
+    Calculate per-step advantage for policy gradient.
 
-    # Okay now im gonna try step-level rewarding instead
-    # since that might be more stable
+    Reward = points_weight * points_earned
+             + smoothness_weight * smoothness_delta
+             + max_tile_weight * max_tile_created
+             + corner_weight * corner_delta
+             + adjacency_weight * adjacency_delta
+             + chain_weight * chain_delta
+             + topological_weight * topological_delta
+             + win_bonus (one-time when 2048 tile is created)
+
+    - points_earned is the raw game score from merges
+    - smoothness_delta rewards moves that improve board structure
+    - max_tile_created (exponent) rewards creating high-value tiles from merges
+    - corner_delta rewards keeping the max tile in a corner
+    - adjacency_delta rewards high-value tiles being adjacent to each other
+    - chain_delta rewards building monotonically decreasing chains from max tile
+    - topological_delta rewards proper tile organization (neighbors, gaps, density)
+    - win_bonus is a one-time reward for creating the 2048 tile (exponent 11)
+    """
+    # 2048 = 2^11, so exponent is 11
+    WIN_TILE_EXPONENT = 11
 
     # first we calculate the reward of each step
     for ep in episodes:
-        total_points = ep["total_points"]
-
-        # we need to be careful with this quantity as it is not strictly causal
-        total_possible_points = sum(m["max_points_possible"] for m in ep["moves"])
-
-        # cumsum lol
-        # points_possible_cum = 0.0
-        # points_earned = 0.0
-
-        # hypothesis 1: we need to use step-level rewards instead of
-        # global rewards for proper grading
-        # hypothesis 2: rewards should encourage long-term progress rather than short-term optimization
-
         for move in ep["moves"]:
-            # points_possible_cum += move["max_points_possible"]
-            move["reward"] = move["points_earned"]
+            # combine merge points with board quality improvement
+            points_reward = move["points_earned"] * points_weight
+            smoothness_reward = move.get("smoothness_delta", 0.0) * smoothness_weight
+            tile_bonus = move.get("max_tile_created", 0) * max_tile_weight
+            corner_bonus = move.get("corner_delta", 0.0) * corner_weight
+            adjacency_bonus = move.get("adjacency_delta", 0.0) * adjacency_weight
+            chain_bonus = move.get("chain_delta", 0.0) * chain_weight
+            topological_bonus = move.get("topological_delta", 0.0) * topological_weight
+
+            # One-time bonus for creating the 2048 tile (detect first crossing)
+            max_before = move.get("max_exponent_before", 0)
+            max_after = move.get("max_exponent_after", max_before)
+            created_2048 = max_before < WIN_TILE_EXPONENT and max_after >= WIN_TILE_EXPONENT
+            win_reward = win_bonus if created_2048 else 0.0
+
+            move["reward"] = (
+                points_reward
+                + smoothness_reward
+                + tile_bonus
+                + corner_bonus
+                + adjacency_bonus
+                + chain_bonus
+                + topological_bonus
+                + win_reward
+            )
 
             # if max(move["points_possible"].values()) == 0:
             #     # this is a tricky case, sometimes it might not be possible to
@@ -305,72 +408,27 @@ def calculate_advantage(episodes: list[dict], gamma: float):
             #     * 2
             # )
 
-    # next we calculate the discount rate
-    total_future_reward = 0.0
-    N = 0
+    # next we calculate the discount rate and per-timestep baseline
+    step_returns_by_t: dict[int, list[float]] = defaultdict(list)
     for ep in episodes:
         moves = ep["moves"]
-        for i, move in list(enumerate(moves))[::-1]:
-            move["future_reward"] = move["reward"]
-            if i < len(moves) - 1:  # check last
-                move["future_reward"] += gamma * moves[i + 1]["future_reward"]
+        G = 0.0
+        for t in reversed(range(len(moves))):
+            move = moves[t]
+            G = move["reward"] + gamma * G
+            move["future_reward"] = G
+            move["t_index"] = t
+            step_returns_by_t[t].append(G)
 
-            # for move in ep["moves"][::-1]:
+    baseline_by_t = {
+        t: sum(values) / len(values) for t, values in step_returns_by_t.items()
+    }
 
-        # calculate future total reward
-        total_future_reward += sum(m["future_reward"] for m in moves)
-        N += len(moves)
-
-    # global average
-    batch_future_reward_mean = total_future_reward / N
-
-    # now we calculate advantage
+    # calculate advantage using timestep-specific baselines (no normalization)
     for ep in episodes:
         for m in ep["moves"]:
-            m["advantage_unnormalized"] = m["future_reward"] - batch_future_reward_mean
-
-    # now we rescale
-
-    # Here I tried to use the harmonic mean to get the advantage, but this still doesnt work
-    # calculate the reward for each model
-    # for episode in episodes:
-    #     # harmonic mean
-    #     episode["reward"] = len(episode["moves"]) / sum(
-    #         1 / m["reward"] * max(1.0, m["highest_points"]) if m["reward"] > 0 else 0
-    #         for m in episode["moves"]
-    #     )
-
-    # calculate advantage
-    # avg_reward = len(rollout_episodes) / sum(
-    #     1 / e["reward"] if e["reward"] > 0 else 0 for e in rollout_episodes
-    # )
-    # N = len(episodes)
-    # avg_reward = sum(e["reward"] for e in episodes) / N
-    # for ep in episodes:
-    #     ep["advantage_unnormalized"] = ep["reward"] - avg_reward
-
-    # next, we calculate the normalized advantage
-
-    advantage_avg = (
-        sum(move["advantage_unnormalized"] for ep in episodes for move in ep["moves"])
-        / N
-    )
-    advantage_stddev = (
-        (1 / (N - 1))
-        * sum(
-            (m["advantage_unnormalized"] - advantage_avg) ** 2
-            for e in episodes
-            for m in e["moves"]
-        )
-    ) ** 0.5
-
-    # add an epsilon for numerical stability
-    eps = 1e-8
-    for ep in episodes:
-        for m in ep["moves"]:
-            m["advantage"] = (m["advantage_unnormalized"] - advantage_avg) / (
-                advantage_stddev + eps
-            )
+            baseline = baseline_by_t.get(m.get("t_index", 0), 0.0)
+            m["advantage"] = m["future_reward"] - baseline
 
     # Here I tried to use the harmonic mean to get the advantage, but this still doesnt work
     # calculate the reward for each model
@@ -481,6 +539,9 @@ def train(
     batch_size: int = typer.Option(
         1, "--batch-size", help="Number of games to play in a given batch"
     ),
+    workers: int = typer.Option(
+        1, "--workers", "-w", help="Number of parallel workers for game execution"
+    ),
     max_steps: int = typer.Option(
         None, "--max-steps", help="Maximum number of steps a game can reach."
     ),
@@ -490,7 +551,52 @@ def train(
     num_layers: int = typer.Option(
         2, "--num-layers", "-l", help="Number of residual hidden layers"
     ),
+    print_frequency: int = typer.Option(
+        10, "--print-freq", "-p", help="Printing frequency"
+    ),
+    show_last_steps: int = typer.Option(
+        0,
+        "--show-last-steps",
+        help="Show the last N steps of the best game (0 = disabled)",
+    ),
+    points_weight: float = typer.Option(
+        1.0, "--points", help="Weight for raw game points (0 = disabled)"
+    ),
+    smoothness_weight: float = typer.Option(
+        1.0, "--smoothness", help="Weight for smoothness reward shaping (0 = disabled)"
+    ),
+    max_tile_weight: float = typer.Option(
+        1.0, "--tile-bonus", help="Weight for max tile created bonus (0 = disabled)"
+    ),
+    corner_weight: float = typer.Option(
+        1.0, "--corner", help="Weight for corner bonus (max tile in corner)"
+    ),
+    adjacency_weight: float = typer.Option(
+        1.0,
+        "--adjacency",
+        help="Weight for adjacency bonus (high-value tiles next to each other)",
+    ),
+    chain_weight: float = typer.Option(
+        1.0,
+        "--chain",
+        help="Weight for monotonic chain bonus (descending sequence from max tile)",
+    ),
+    topological_weight: float = typer.Option(
+        1.0,
+        "--topo",
+        help="Weight for topological score (proper neighbors, gap penalty, corner density)",
+    ),
+    win_bonus: float = typer.Option(
+        1000.0,
+        "--win-bonus",
+        help="One-time bonus for creating the 2048 tile",
+    ),
     gpu: bool = typer.Option(False, "--gpu", help="Use CUDA:0 for training"),
+    viz_dir: Optional[str] = typer.Option(
+        None,
+        "--viz-dir",
+        help="Directory to export visualization data (disabled if not set)",
+    ),
 ):
     """Watch the AI play 2048."""
     device = torch.device("cuda:0" if gpu and torch.cuda.is_available() else "cpu")
@@ -534,24 +640,45 @@ def train(
 
     # train the model
     highest_score = 0
-    for train_step in tqdm(range(steps), desc=f"Running RL training", disable=True):
+    for train_step in tqdm(range(steps), desc=f"Running RL training"):
         model.eval()
 
         # here we compute a single pass
         rollout_episodes = []
 
-        # game loop
-        for i in range(batch_size):
-            episode_data = play_game_for_episode(
-                model, max_steps=max_steps, device=device
-            )
-            rollout_episodes.append(episode_data)
-            # total_points = episode_data["total_points"]
-            # print(
-            #     f"Game {i + 1} average reward: {total_reward:.3f}, points: {total_points}"
-            # )
+        # game loop - parallel if workers > 1
+        if workers > 1:
+            # Prepare args for worker processes (state dict, config, max_steps)
+            state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
+            config_dict = {
+                "hidden_dim": hidden_size,
+                "num_layers": num_layers,
+                "dropout": 0.0,  # dropout not used at inference
+            }
+            worker_args = [
+                (state_dict, config_dict, max_steps) for _ in range(batch_size)
+            ]
 
-        rollout_episodes = calculate_advantage(rollout_episodes, gamma)
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                rollout_episodes = list(executor.map(_worker_play_game, worker_args))
+        else:
+            for _ in range(batch_size):
+                rollout_episodes.append(
+                    play_game_for_episode(model, max_steps=max_steps, device=device)
+                )
+
+        rollout_episodes = calculate_advantage(
+            rollout_episodes,
+            gamma,
+            points_weight,
+            smoothness_weight,
+            max_tile_weight,
+            corner_weight,
+            adjacency_weight,
+            chain_weight,
+            topological_weight,
+            win_bonus,
+        )
 
         # Now we update the model's policy using this rollout
         stats = model_optimize_step(model, rollout_episodes, optimizer, beta, device)
@@ -568,22 +695,181 @@ def train(
         )
 
         # Print stats instead of updating progress bar
-        if train_step % 25 == 0:
-            advantages = [
-                m["advantage"] for ep in rollout_episodes for m in ep["moves"]
-            ]
-            min_adv = min(advantages)
-            max_adv = max(advantages)
-            print(
-                f"Step {train_step}: loss={stats['loss']:.4f}, "
-                f"entropy={stats.get('entropy', 0):.4f}, "
-                f"grad_norm={stats.get('grad_norm', 0):.4f}, "
-                f"peak_score={highest_score}, "
-                f"avg_steps={avg_steps:.1f}, "
-                f"avg_score={sum([episode['total_points'] for episode in rollout_episodes]) / len(rollout_episodes):.1f}, "
-                f"highest_score={max([episode['total_points'] for episode in rollout_episodes]):.1f}, "
-                f"adv_range=[{min_adv:.3f}, {max_adv:.3f}]"
+        if train_step % print_frequency == 0:
+            # collect per-step metrics
+            all_moves = [m for ep in rollout_episodes for m in ep["moves"]]
+            rewards = [m["reward"] for m in all_moves]
+            advantages = [m["advantage"] for m in all_moves]
+            future_rewards = [m["future_reward"] for m in all_moves]
+
+            # compute variances
+            n = len(rewards)
+            reward_mean = sum(rewards) / n
+            reward_var = sum((r - reward_mean) ** 2 for r in rewards) / n
+
+            adv_mean = sum(advantages) / n
+            adv_var = sum((a - adv_mean) ** 2 for a in advantages) / n
+
+            future_mean = sum(future_rewards) / n
+            future_var = sum((f - future_mean) ** 2 for f in future_rewards) / n
+
+            # count zero rewards (sparse signal indicator)
+            zero_reward_pct = sum(1 for r in rewards if r == 0) / n * 100
+
+            avg_score = sum([ep["total_points"] for ep in rollout_episodes]) / len(
+                rollout_episodes
             )
+            typer.echo(f"--- Step {train_step} ---")
+            typer.echo(f"  loss:           {stats['loss']:.4f}")
+            typer.echo(f"  grad_norm:      {stats.get('grad_norm', 0):.4f}")
+            typer.echo(f"  peak_score:     {highest_score}")
+            typer.echo(f"  avg_score:      {avg_score:.1f}")
+            typer.echo(f"  reward_var:     {reward_var:.2f}")
+            typer.echo(f"  future_var:     {future_var:.2f}")
+            typer.echo(f"  advantage_var:  {adv_var:.2f}")
+            typer.echo(f"  reward_mean:    {reward_mean:.2f}")
+            typer.echo(f"  zero_reward%:   {zero_reward_pct:.1f}%")
+            typer.echo(
+                f"  adv_range:      [{min(advantages):.2f}, {max(advantages):.2f}]"
+            )
+
+            # Find and display the best game from this batch
+            best_episode = max(rollout_episodes, key=lambda ep: ep["total_points"])
+            typer.echo(
+                f"\n  Best game this batch (score: {best_episode['total_points']}, steps: {best_episode['total_steps']}):"
+            )
+
+            # Calculate reward breakdown for best episode
+            if best_episode["moves"]:
+                total_points = sum(
+                    m.get("points_earned", 0) for m in best_episode["moves"]
+                )
+                total_smoothness = sum(
+                    m.get("smoothness_delta", 0) for m in best_episode["moves"]
+                )
+                total_tile_bonus = sum(
+                    m.get("max_tile_created", 0) for m in best_episode["moves"]
+                )
+                total_corner = sum(
+                    m.get("corner_delta", 0) for m in best_episode["moves"]
+                )
+                total_adjacency = sum(
+                    m.get("adjacency_delta", 0) for m in best_episode["moves"]
+                )
+                total_chain = sum(
+                    m.get("chain_delta", 0) for m in best_episode["moves"]
+                )
+                total_topo = sum(
+                    m.get("topological_delta", 0) for m in best_episode["moves"]
+                )
+
+                # Build reward breakdown table
+                reward_components = [
+                    ("points_earned", total_points, points_weight),
+                    ("smoothness", total_smoothness, smoothness_weight),
+                    ("tile_bonus", total_tile_bonus, max_tile_weight),
+                    ("corner", total_corner, corner_weight),
+                    ("adjacency", total_adjacency, adjacency_weight),
+                    ("chain", total_chain, chain_weight),
+                    ("topological", total_topo, topological_weight),
+                ]
+
+                typer.echo("  Reward breakdown:")
+                typer.echo("    ┌─────────────────┬──────────┬────────┬──────────┐")
+                typer.echo("    │ Component       │      Raw │ Weight │ Weighted │")
+                typer.echo("    ├─────────────────┼──────────┼────────┼──────────┤")
+                total_weighted = 0.0
+                for name, raw, weight in reward_components:
+                    weighted = raw * weight
+                    total_weighted += weighted
+                    typer.echo(
+                        f"    │ {name:<15} │ {raw:>8.1f} │ {weight:>6.2f} │ {weighted:>8.1f} │"
+                    )
+                typer.echo("    ├─────────────────┼──────────┼────────┼──────────┤")
+                typer.echo(
+                    f"    │ {'TOTAL':<15} │          │        │ {total_weighted:>8.1f} │"
+                )
+                typer.echo("    └─────────────────┴──────────┴────────┴──────────┘")
+
+            # Show last N steps if requested
+            if show_last_steps > 0 and best_episode["moves"]:
+                direction_names = ["UP", "DOWN", "LEFT", "RIGHT"]
+                moves_to_show = best_episode["moves"][-show_last_steps:]
+                start_idx = len(best_episode["moves"]) - len(moves_to_show)
+
+                # Summary line with points for each step
+                pts_summary = [str(m.get("points_earned", 0)) for m in moves_to_show]
+                typer.echo(
+                    f"\n  Last {len(moves_to_show)} steps (pts: {' → '.join(pts_summary)}):"
+                )
+
+                for i, move in enumerate(moves_to_show):
+                    step_num = start_idx + i + 1
+                    action = direction_names[move["selected_direction"]]
+                    pts = move.get("points_earned", 0)
+                    typer.echo(f"\n  Step {step_num}: {action} (+{pts} pts)")
+                    if "result_state" in move:
+                        typer.echo(format_grid(move["result_state"], indent="  "))
+
+            if "final_state" in best_episode:
+                typer.echo("\n  Final state:")
+                typer.echo(format_grid(best_episode["final_state"], indent="  "))
+
+            # Export visualization data if viz_dir is set
+            if viz_dir and best_episode["moves"]:
+                viz_path = Path(viz_dir)
+                viz_path.mkdir(parents=True, exist_ok=True)
+
+                # Convert grid from exponents to actual tile values
+                def grid_to_values(grid):
+                    return [
+                        [2**cell if cell > 0 else 0 for cell in row] for row in grid
+                    ]
+
+                direction_names = ["UP", "DOWN", "LEFT", "RIGHT"]
+                viz_data = {
+                    "step": train_step,
+                    "score": best_episode["total_points"],
+                    "total_steps": best_episode["total_steps"],
+                    "moves": [],
+                }
+
+                for i, move in enumerate(best_episode["moves"]):
+                    state_before = move.get("state_before", [])
+                    state_after = move.get("result_state", [])
+                    move_data = {
+                        "step": i + 1,
+                        "state_before": grid_to_values(state_before)
+                        if state_before
+                        else [],
+                        "action": direction_names[move["selected_direction"]],
+                        "state_after": grid_to_values(state_after)
+                        if state_after
+                        else [],
+                        "points_earned": move.get("points_earned", 0),
+                        "rewards": {
+                            "points": move.get("points_earned", 0) * points_weight,
+                            "smoothness": move.get("smoothness_delta", 0)
+                            * smoothness_weight,
+                            "tile_bonus": move.get("max_tile_created", 0)
+                            * max_tile_weight,
+                            "corner": move.get("corner_delta", 0) * corner_weight,
+                            "adjacency": move.get("adjacency_delta", 0)
+                            * adjacency_weight,
+                            "chain": move.get("chain_delta", 0) * chain_weight,
+                            "topological": move.get("topological_delta", 0)
+                            * topological_weight,
+                        },
+                        "entropy": move.get("entropy", 0.0),
+                        "advantage": move.get("advantage", 0.0),
+                    }
+                    viz_data["moves"].append(move_data)
+
+                export_file = viz_path / f"step_{train_step:06d}.json"
+                with open(export_file, "w") as f:
+                    json.dump(viz_data, f, indent=2)
+
+            typer.echo("")  # Blank line for readability
 
 
 @app.command()
@@ -599,14 +885,114 @@ def evaluate(
     typer.echo("Evaluation not yet implemented")
 
 
+def get_keypress():
+    """Read a single keypress from the terminal."""
+    import sys
+    import tty
+    import termios
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        ch = sys.stdin.read(1)
+        # Handle arrow keys (escape sequences)
+        if ch == "\x1b":
+            ch += sys.stdin.read(2)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return ch
+
+
+@app.command()
+def human():
+    """Play 2048 yourself! Controls: WASD or Arrow keys, Q to quit."""
+    import os
+
+    # Clear screen
+    os.system("clear" if os.name == "posix" else "cls")
+
+    typer.echo("🎮 2048 - Human Player Mode")
+    typer.echo("Controls: W/↑=Up, S/↓=Down, A/←=Left, D/→=Right, Q=Quit")
+    typer.echo("-" * 40)
+
+    game = Game2048()
+    game.reset()
+
+    move_count = 0
+
+    # Key mappings
+    key_to_direction = {
+        "w": Direction.UP,
+        "a": Direction.LEFT,
+        "s": Direction.DOWN,
+        "d": Direction.RIGHT,
+        "\x1b[A": Direction.UP,  # Up arrow
+        "\x1b[B": Direction.DOWN,  # Down arrow
+        "\x1b[C": Direction.RIGHT,  # Right arrow
+        "\x1b[D": Direction.LEFT,  # Left arrow
+    }
+
+    display_board(game)
+
+    while game.has_next_step():
+        typer.echo("\nYour move: ", nl=False)
+
+        key = get_keypress()
+
+        # Handle quit
+        if key.lower() == "q":
+            typer.echo("\n\n👋 Thanks for playing!")
+            break
+
+        # Map key to direction
+        direction = key_to_direction.get(key.lower() if len(key) == 1 else key)
+
+        if direction is None:
+            typer.echo("Invalid key. Use WASD or arrow keys.")
+            continue
+
+        if not game.direction_has_step(direction):
+            typer.echo(f"Can't move {direction.value}! Try another direction.")
+            continue
+
+        # Make the move
+        _, points_earned, done, _ = game.step(direction)
+        move_count += 1
+
+        # Clear screen and redraw
+        os.system("clear" if os.name == "posix" else "cls")
+        typer.echo("🎮 2048 - Human Player Mode")
+        typer.echo("Controls: W/↑=Up, S/↓=Down, A/←=Left, D/→=Right, Q=Quit")
+        typer.echo("-" * 40)
+        typer.echo(
+            f"Move {move_count}: {direction.value.upper()} (+{points_earned} points)"
+        )
+
+        display_board(game)
+
+        if done:
+            break
+
+    # Game over
+    typer.echo("\n" + "=" * 40)
+    typer.echo("🎮 GAME OVER!")
+    typer.echo(f"Final Score: {game.get_score()}")
+    typer.echo(f"Total Moves: {move_count}")
+
+    # Find highest tile
+    max_tile = max(2**cell if cell > 0 else 0 for row in game.grid for cell in row)
+    typer.echo(f"Highest Tile: {max_tile}")
+
+    if max_tile >= 2048:
+        typer.echo("🎉 Congratulations! You reached 2048!")
+    typer.echo("=" * 40)
+
+
 def display_board(game: Game2048) -> None:
     """Display the game board in a nice format."""
-    typer.echo("\n" + "=" * 25)
-    for row in game.grid:
-        # convert exponents to actual values (0 stays 0, exponent k becomes 2^k)
-        display_row = [str(2**cell if cell > 0 else 0).rjust(5) for cell in row]
-        typer.echo("│" + "│".join(display_row) + "│")
-    typer.echo("=" * 25)
+    typer.echo("")
+    typer.echo(format_grid(game.grid, indent=""))
     typer.echo(f"Score: {game.get_score()}")
 
 

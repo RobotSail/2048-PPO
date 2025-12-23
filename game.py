@@ -104,13 +104,14 @@ class Game2048:
         ) or Game2048.can_merge_in_direction(self.grid, direction)
 
     @staticmethod
-    def simulate_move(grid: Grid, direction: Direction) -> tuple[Grid, int]:
+    def simulate_move(grid: Grid, direction: Direction) -> tuple[Grid, int, int]:
         """
         Simulate a move on a grid copy without mutating the original.
-        Returns (resulting_grid, score_gained_from_merges).
+        Returns (resulting_grid, score_gained_from_merges, max_tile_created_exponent).
         """
         new_grid = [row[:] for row in grid]
         total_score = 0
+        max_tile_created = 0
 
         if direction == Direction.UP:
             working_grid = [
@@ -121,6 +122,7 @@ class Game2048:
             ]
             working_grid = [r[0] for r in results]
             total_score = sum(r[1] for r in results)
+            max_tile_created = max(r[2] for r in results)
             new_grid = [
                 [working_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)
             ]
@@ -133,6 +135,7 @@ class Game2048:
             ]
             working_grid = [r[0] for r in results]
             total_score = sum(r[1] for r in results)
+            max_tile_created = max(r[2] for r in results)
             new_grid = [
                 [working_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)
             ]
@@ -142,14 +145,16 @@ class Game2048:
             ]
             new_grid = [r[0] for r in results]
             total_score = sum(r[1] for r in results)
+            max_tile_created = max(r[2] for r in results)
         elif direction == Direction.RIGHT:
             results = [
                 Game2048._merge_and_shift_right_with_score(row) for row in new_grid
             ]
             new_grid = [r[0] for r in results]
             total_score = sum(r[1] for r in results)
+            max_tile_created = max(r[2] for r in results)
 
-        return new_grid, total_score
+        return new_grid, total_score, max_tile_created
 
     @staticmethod
     def calculate_grid_score(grid: Grid) -> int:
@@ -170,7 +175,7 @@ class Game2048:
                 results[direction] = 0
                 continue
 
-            _, score_gained = Game2048.simulate_move(self.grid, direction)
+            _, score_gained, _ = Game2048.simulate_move(self.grid, direction)
             results[direction] = score_gained
 
         return results
@@ -218,41 +223,45 @@ class Game2048:
     @staticmethod
     def _merge_and_shift_left(row: list[int]) -> list[int]:
         """Merge and shift a row to the left. Row contains exponents."""
-        result, _ = Game2048._merge_and_shift_left_with_score(row)
+        result, _, _ = Game2048._merge_and_shift_left_with_score(row)
         return result
 
     @staticmethod
-    def _merge_and_shift_left_with_score(row: list[int]) -> tuple[list[int], int]:
-        """Merge and shift a row to the left, returning (new_row, score_gained)."""
+    def _merge_and_shift_left_with_score(row: list[int]) -> tuple[list[int], int, int]:
+        """Merge and shift a row to the left, returning (new_row, score_gained, max_tile_created)."""
         non_zero = [x for x in row if x != 0]
 
         merged = []
         score = 0
+        max_tile_created = 0
         i = 0
         while i < len(non_zero):
             if i + 1 < len(non_zero) and non_zero[i] == non_zero[i + 1]:
                 new_exp = non_zero[i] + 1
                 merged.append(new_exp)
                 score += 2**new_exp  # points = value of merged tile
+                max_tile_created = max(max_tile_created, new_exp)
                 i += 2
             else:
                 merged.append(non_zero[i])
                 i += 1
 
-        return merged + [0] * (GRID_SIZE - len(merged)), score
+        return merged + [0] * (GRID_SIZE - len(merged)), score, max_tile_created
 
     @staticmethod
     def _merge_and_shift_right(row: list[int]) -> list[int]:
         """Merge and shift a row to the right. Row contains exponents."""
-        result, _ = Game2048._merge_and_shift_right_with_score(row)
+        result, _, _ = Game2048._merge_and_shift_right_with_score(row)
         return result
 
     @staticmethod
-    def _merge_and_shift_right_with_score(row: list[int]) -> tuple[list[int], int]:
-        """Merge and shift a row to the right, returning (new_row, score_gained)."""
+    def _merge_and_shift_right_with_score(row: list[int]) -> tuple[list[int], int, int]:
+        """Merge and shift a row to the right, returning (new_row, score_gained, max_tile_created)."""
         reversed_row = row[::-1]
-        merged, score = Game2048._merge_and_shift_left_with_score(reversed_row)
-        return merged[::-1], score
+        merged, score, max_tile = Game2048._merge_and_shift_left_with_score(
+            reversed_row
+        )
+        return merged[::-1], score, max_tile
 
     @staticmethod
     def can_move_in_direction(state: Grid, direction: Direction) -> bool:
@@ -335,6 +344,375 @@ class Game2048:
         """
         return self.score()
 
+    @staticmethod
+    def smoothness_score(grid: Grid) -> float:
+        """
+        Measure board smoothness: how similar are adjacent tiles?
+        Higher score = smoother = better (tiles clustered by similar values).
+
+        Returns negative sum of exponent differences between adjacent non-empty cells.
+        """
+        score = 0.0
+        for i in range(GRID_SIZE):
+            for j in range(GRID_SIZE):
+                if grid[i][j] == 0:
+                    continue
+                # check right neighbor
+                if j < GRID_SIZE - 1 and grid[i][j + 1] != 0:
+                    score -= abs(grid[i][j] - grid[i][j + 1])
+                # check down neighbor
+                if i < GRID_SIZE - 1 and grid[i + 1][j] != 0:
+                    score -= abs(grid[i][j] - grid[i + 1][j])
+        return score
+
+    @staticmethod
+    def corner_bonus(grid: Grid) -> float:
+        """
+        Returns a bonus/penalty based on max tile position.
+        - Positive bonus (exponent) if ANY max tile is in a corner
+        - Negative penalty (-exponent) if NO max tile is in a corner
+
+        This creates a strong incentive to keep the max tile in a corner,
+        and penalizes moving it away.
+        """
+        corners = {
+            (0, 0),
+            (0, GRID_SIZE - 1),
+            (GRID_SIZE - 1, 0),
+            (GRID_SIZE - 1, GRID_SIZE - 1),
+        }
+
+        # Find the max value
+        max_val = 0
+        for i in range(GRID_SIZE):
+            for j in range(GRID_SIZE):
+                if grid[i][j] > max_val:
+                    max_val = grid[i][j]
+
+        if max_val == 0:
+            return 0.0
+
+        # Check if ANY max tile is in a corner
+        max_in_corner = False
+        for i in range(GRID_SIZE):
+            for j in range(GRID_SIZE):
+                if grid[i][j] == max_val and (i, j) in corners:
+                    max_in_corner = True
+                    break
+            if max_in_corner:
+                break
+
+        if max_in_corner:
+            return float(max_val)  # Positive bonus for having max in corner
+        else:
+            return -float(max_val)  # Negative penalty for NOT having max in corner
+
+    @staticmethod
+    def adjacency_bonus(grid: Grid) -> float:
+        """
+        Returns a bonus for having high-value tiles adjacent to the maximum tile.
+        Also rewards pairs of high-value tiles (exponent >= 5, i.e., 32+) that are adjacent.
+        """
+        # Find max tile position
+        max_val = 0
+        max_pos = (0, 0)
+        for i in range(GRID_SIZE):
+            for j in range(GRID_SIZE):
+                if grid[i][j] > max_val:
+                    max_val = grid[i][j]
+                    max_pos = (i, j)
+
+        bonus = 0.0
+        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+        # Bonus for tiles adjacent to max tile
+        for di, dj in directions:
+            ni, nj = max_pos[0] + di, max_pos[1] + dj
+            if 0 <= ni < GRID_SIZE and 0 <= nj < GRID_SIZE:
+                neighbor_val = grid[ni][nj]
+                if neighbor_val > 0:
+                    # Reward based on how close the neighbor is to max (smaller diff = better)
+                    # Also scale by the neighbor's value
+                    bonus += neighbor_val * 0.5  # Half the exponent as bonus
+
+        # Bonus for adjacent high-value pairs (exponent >= 5 means tile >= 32)
+        HIGH_VALUE_THRESHOLD = 5
+        for i in range(GRID_SIZE):
+            for j in range(GRID_SIZE):
+                if grid[i][j] >= HIGH_VALUE_THRESHOLD:
+                    # Check right neighbor
+                    if j < GRID_SIZE - 1 and grid[i][j + 1] >= HIGH_VALUE_THRESHOLD:
+                        # Bonus = sum of exponents for the pair
+                        bonus += (grid[i][j] + grid[i][j + 1]) * 0.25
+                    # Check down neighbor
+                    if i < GRID_SIZE - 1 and grid[i + 1][j] >= HIGH_VALUE_THRESHOLD:
+                        bonus += (grid[i][j] + grid[i + 1][j]) * 0.25
+
+        return bonus
+
+    @staticmethod
+    def monotonic_chain_score(grid: Grid) -> float:
+        """
+        Calculate the length of the longest monotonically decreasing chain
+        starting from ANY maximum tile.
+
+        A valid chain requires each step to be exactly one exponent lower than
+        the previous (e.g., 512 -> 256 -> 128 -> 64).
+
+        This rewards the "snake pattern" that strong 2048 players use.
+        Returns the sum of exponents in the chain (weighted by position).
+        """
+        # Find max value
+        max_val = 0
+        for i in range(GRID_SIZE):
+            for j in range(GRID_SIZE):
+                if grid[i][j] > max_val:
+                    max_val = grid[i][j]
+
+        if max_val == 0:
+            return 0.0
+
+        # Find ALL positions with max value
+        max_positions = []
+        for i in range(GRID_SIZE):
+            for j in range(GRID_SIZE):
+                if grid[i][j] == max_val:
+                    max_positions.append((i, j))
+
+        # DFS to find the longest chain of consecutive descending exponents
+        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+        def dfs(pos: tuple[int, int], expected_exp: int, visited: set) -> float:
+            """DFS to find chain, returns total score of this branch."""
+            if pos in visited:
+                return 0.0
+            i, j = pos
+            if not (0 <= i < GRID_SIZE and 0 <= j < GRID_SIZE):
+                return 0.0
+            if grid[i][j] != expected_exp:
+                return 0.0
+
+            visited.add(pos)
+            # Score: exponent value, weighted slightly by depth to prefer longer chains
+            score = float(expected_exp)
+
+            # Continue chain with neighbors that are exactly one exponent lower
+            best_continuation = 0.0
+            for di, dj in directions:
+                ni, nj = i + di, j + dj
+                continuation = dfs((ni, nj), expected_exp - 1, visited)
+                best_continuation = max(best_continuation, continuation)
+
+            visited.remove(pos)  # Allow other branches to use this cell
+            return score + best_continuation
+
+        # Try starting from EACH max tile and take the best result
+        best_chain_score = 0.0
+        for max_pos in max_positions:
+            chain_score = dfs(max_pos, max_val, set())
+            best_chain_score = max(best_chain_score, chain_score)
+
+        return best_chain_score
+
+    @staticmethod
+    def _position_multiplier(row: int, col: int) -> float:
+        """
+        Returns a multiplier based on position:
+        - Corner: 1.0 (full bonus)
+        - Edge (not corner): 0.2 (partial bonus)
+        - Center: 0.0 (no bonus)
+        """
+        is_edge_row = row == 0 or row == GRID_SIZE - 1
+        is_edge_col = col == 0 or col == GRID_SIZE - 1
+
+        if is_edge_row and is_edge_col:
+            return 1.0  # Corner
+        elif is_edge_row or is_edge_col:
+            return 0.2  # Edge but not corner
+        else:
+            return 0.0  # Center
+
+    @staticmethod
+    def _get_snake_order(corner: tuple[int, int]) -> list[tuple[int, int]]:
+        """
+        Generate the ideal snake path starting from the given corner.
+        Returns list of (row, col) positions in order from corner outward.
+        """
+        cr, cc = corner
+        # Determine direction multipliers based on corner
+        row_dir = 1 if cr == 0 else -1
+        col_dir = 1 if cc == 0 else -1
+
+        order = []
+        for i in range(GRID_SIZE):
+            row = cr + i * row_dir
+            # Alternate direction each row for snake pattern
+            if i % 2 == 0:
+                cols = range(cc, cc + GRID_SIZE * col_dir, col_dir)
+            else:
+                cols = range(cc + (GRID_SIZE - 1) * col_dir, cc - col_dir, -col_dir)
+            for col in cols:
+                if 0 <= col < GRID_SIZE:
+                    order.append((row, col))
+        return order
+
+    @staticmethod
+    def _choose_anchor_corner(grid: Grid) -> tuple[int, int]:
+        """
+        Select a consistent anchor corner for topological scoring.
+        Prefer the corner that already holds a max tile; otherwise pick
+        the corner closest (Manhattan distance) to the first max tile found.
+        """
+        corners = [
+            (0, 0),
+            (0, GRID_SIZE - 1),
+            (GRID_SIZE - 1, 0),
+            (GRID_SIZE - 1, GRID_SIZE - 1),
+        ]
+
+        max_val = 0
+        max_positions = []
+        for i in range(GRID_SIZE):
+            for j in range(GRID_SIZE):
+                if grid[i][j] > max_val:
+                    max_val = grid[i][j]
+                    max_positions = [(i, j)]
+                elif grid[i][j] == max_val and max_val > 0:
+                    max_positions.append((i, j))
+
+        if not max_positions:
+            return corners[0]
+
+        # If any max tile is already in a corner, lock to that corner.
+        for pos in max_positions:
+            if pos in corners:
+                return pos
+
+        # Otherwise choose the closest corner to the first max tile (deterministic).
+        target = max_positions[0]
+        return min(corners, key=lambda c: abs(c[0] - target[0]) + abs(c[1] - target[1]))
+
+    @staticmethod
+    def topological_score(grid: Grid, anchor_corner: tuple[int, int] | None = None) -> float:
+        """
+        Calculate a gradient-based topological score.
+
+        The ideal 2048 board has tiles arranged in a "snake" pattern from a corner,
+        with values monotonically decreasing along the path. This function measures
+        how well the current board matches this ideal.
+
+        Scoring components:
+        1. Gradient consistency: Reward tiles that follow monotonic decrease along snake
+        2. Inversion penalty: Penalize when higher tiles are "behind" lower ones
+        3. Trapped tile penalty: High tiles surrounded by much lower tiles
+        4. Corner anchoring: Bonus for max tile in corner
+
+        Returns a score where higher = better organized board.
+        """
+        # Find all non-zero tiles
+        tiles = []
+        for i in range(GRID_SIZE):
+            for j in range(GRID_SIZE):
+                if grid[i][j] > 0:
+                    tiles.append((grid[i][j], i, j))
+
+        if not tiles:
+            return 0.0
+
+        # Find the max tile value and its positions
+        max_val = max(t[0] for t in tiles)
+
+        # Define corners and find the best one (where max tile is, or best gradient)
+        corners = (
+            [anchor_corner]
+            if anchor_corner is not None
+            else [
+                (0, 0),
+                (0, GRID_SIZE - 1),
+                (GRID_SIZE - 1, 0),
+                (GRID_SIZE - 1, GRID_SIZE - 1),
+            ]
+        )
+
+        best_score = float("-inf")
+
+        for corner in corners:
+            snake_order = Game2048._get_snake_order(corner)
+
+            # Create position-to-snake-index mapping
+            pos_to_idx = {pos: idx for idx, pos in enumerate(snake_order)}
+
+            score = 0.0
+
+            # 1. Gradient consistency score
+            # For each tile, check if tiles earlier in snake order are >= its value
+            for val, row, col in tiles:
+                tile_idx = pos_to_idx[(row, col)]
+
+                # Bonus for being in a good position relative to value rank
+                # Higher values should be earlier in the snake order
+                position_bonus = (16 - tile_idx) * val * 0.1
+                score += position_bonus
+
+            # 2. Monotonicity along snake path
+            prev_val = float("inf")
+            monotonic_bonus = 0.0
+            inversion_penalty = 0.0
+
+            for pos in snake_order:
+                row, col = pos
+                val = grid[row][col]
+                if val == 0:
+                    continue
+
+                if val <= prev_val:
+                    # Good: value is decreasing or equal (merge potential)
+                    monotonic_bonus += val * 0.2
+                else:
+                    # Bad: inversion - higher value appears later in snake
+                    # Penalty proportional to how "wrong" this is
+                    inversion_penalty += (val - prev_val) * 0.5
+
+                prev_val = val
+
+            score += monotonic_bonus - inversion_penalty
+
+            # 3. Max tile anchoring bonus
+            cr, cc = corner
+            if grid[cr][cc] == max_val:
+                score += max_val * 2.0  # Strong bonus for max in corner
+
+            # 4. Trapped tile penalty
+            # A tile is "trapped" if it's high value but surrounded by much lower tiles
+            # and not in a good snake position
+            directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+            for val, row, col in tiles:
+                if val < 4:  # Only check tiles >= 16 (exponent 4)
+                    continue
+
+                tile_idx = pos_to_idx[(row, col)]
+                neighbors_lower = 0
+                total_neighbors = 0
+
+                for di, dj in directions:
+                    ni, nj = row + di, col + dj
+                    if 0 <= ni < GRID_SIZE and 0 <= nj < GRID_SIZE:
+                        neighbor_val = grid[ni][nj]
+                        if neighbor_val > 0:
+                            total_neighbors += 1
+                            if neighbor_val < val - 2:  # 2+ exponents lower
+                                neighbors_lower += 1
+
+                # Trapped: high tile surrounded mostly by much lower tiles
+                # and in a bad snake position (late in order)
+                if total_neighbors >= 2 and neighbors_lower >= total_neighbors - 1:
+                    if tile_idx > 4:  # Not in first few snake positions
+                        score -= val * 1.0  # Penalty for trapped high tile
+
+            best_score = max(best_score, score)
+
+        return best_score
+
     def _add_tile(self) -> bool:
         """
         Add a new tile (90% chance of 2, 10% chance of 4) to a random empty cell.
@@ -369,17 +747,45 @@ class Game2048:
         Take a step in the game by moving in the specified direction.
         Returns (new_state, reward, done, info) for RL compatibility.
         Reward is the points gained from merging tiles.
+        Info includes deltas for reward shaping heuristics.
         """
         if not self.direction_has_step(direction):
             return (
                 [row[:] for row in self.grid],
                 0,
                 not self.has_next_step(),
-                {"invalid_move": True},
+                {
+                    "invalid_move": True,
+                    "smoothness_delta": 0.0,
+                    "max_tile_created": 0,
+                    "corner_delta": 0.0,
+                    "adjacency_delta": 0.0,
+                    "chain_delta": 0.0,
+                    "topological_delta": 0.0,
+                },
             )
 
-        new_grid, points_earned = Game2048.simulate_move(self.grid, direction)
+        # compute heuristics before move
+        smoothness_before = Game2048.smoothness_score(self.grid)
+        corner_before = Game2048.corner_bonus(self.grid)
+        adjacency_before = Game2048.adjacency_bonus(self.grid)
+        chain_before = Game2048.monotonic_chain_score(self.grid)
+        anchor_corner = Game2048._choose_anchor_corner(self.grid)
+        topological_before = Game2048.topological_score(self.grid, anchor_corner)
+        max_exp_before = max(max(row) for row in self.grid)
+
+        new_grid, points_earned, max_tile_created = Game2048.simulate_move(
+            self.grid, direction
+        )
         self.grid = new_grid
+
+        # compute heuristics after move but before random spawn (to avoid reward hacking)
+        smoothness_after = Game2048.smoothness_score(new_grid)
+        corner_after = Game2048.corner_bonus(new_grid)
+        adjacency_after = Game2048.adjacency_bonus(new_grid)
+        chain_after = Game2048.monotonic_chain_score(new_grid)
+        topological_after = Game2048.topological_score(new_grid, anchor_corner)
+        max_exp_after = max(max(row) for row in new_grid)
 
         # spawn a new tile after successful move
         self._add_tile()
@@ -389,7 +795,18 @@ class Game2048:
             [row[:] for row in self.grid],
             points_earned,
             done,
-            {"invalid_move": False},
+            {
+                "invalid_move": False,
+                "smoothness_delta": smoothness_after - smoothness_before,
+                "max_tile_created": max_tile_created,
+                "max_exponent_before": max_exp_before,
+                "max_exponent_after": max_exp_after,
+                "corner_delta": corner_after - corner_before,
+                "adjacency_delta": adjacency_after - adjacency_before,
+                "chain_delta": chain_after - chain_before,
+                "topological_delta": topological_after - topological_before,
+                "topological_anchor": anchor_corner,
+            },
         )
 
 

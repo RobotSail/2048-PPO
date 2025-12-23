@@ -1,0 +1,862 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>2048 Training Visualizer</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #0d1117;
+            --bg-card: #161b22;
+            --bg-hover: #21262d;
+            --border: #30363d;
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --accent: #58a6ff;
+            --accent-dim: #388bfd33;
+            --success: #3fb950;
+            --warning: #d29922;
+            --tile-2: #eee4da;
+            --tile-4: #ede0c8;
+            --tile-8: #f2b179;
+            --tile-16: #f59563;
+            --tile-32: #f67c5f;
+            --tile-64: #f65e3b;
+            --tile-128: #edcf72;
+            --tile-256: #edcc61;
+            --tile-512: #edc850;
+            --tile-1024: #edc53f;
+            --tile-2048: #edc22e;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Space Grotesk', sans-serif;
+            background: var(--bg-dark);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 280px;
+            background: var(--bg-card);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            position: fixed;
+        }
+
+        .sidebar-header {
+            padding: 20px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .sidebar-header h1 {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--accent);
+        }
+
+        .sidebar-header p {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 4px;
+        }
+
+        .checkpoint-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 12px;
+        }
+
+        .checkpoint-item {
+            padding: 12px;
+            border-radius: 8px;
+            cursor: pointer;
+            margin-bottom: 8px;
+            transition: background 0.15s;
+            border: 1px solid transparent;
+        }
+
+        .checkpoint-item:hover {
+            background: var(--bg-hover);
+        }
+
+        .checkpoint-item.active {
+            background: var(--accent-dim);
+            border-color: var(--accent);
+        }
+
+        .checkpoint-step {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .checkpoint-meta {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            margin-top: 4px;
+        }
+
+        .checkpoint-score {
+            color: var(--success);
+            font-weight: 500;
+        }
+
+        /* Main content */
+        .main {
+            margin-left: 280px;
+            flex: 1;
+            padding: 32px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 60vh;
+            color: var(--text-secondary);
+        }
+
+        .empty-state svg {
+            width: 64px;
+            height: 64px;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }
+
+        /* Game container */
+        .game-container {
+            display: flex;
+            gap: 32px;
+            align-items: flex-start;
+        }
+
+        /* Game board */
+        .board-section {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .action-indicator {
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin-bottom: 16px;
+            height: 40px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .action-arrow {
+            font-size: 2rem;
+            color: var(--accent);
+        }
+
+        .game-board {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px;
+            padding: 12px;
+            background: #776e65;
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+        }
+
+        .tile {
+            width: 80px;
+            height: 80px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 700;
+            font-size: 1.5rem;
+            border-radius: 6px;
+            background: rgba(238, 228, 218, 0.35);
+            color: #776e65;
+            transition: all 0.15s ease;
+        }
+
+        .tile.value-2 { background: var(--tile-2); }
+        .tile.value-4 { background: var(--tile-4); }
+        .tile.value-8 { background: var(--tile-8); color: #f9f6f2; }
+        .tile.value-16 { background: var(--tile-16); color: #f9f6f2; }
+        .tile.value-32 { background: var(--tile-32); color: #f9f6f2; }
+        .tile.value-64 { background: var(--tile-64); color: #f9f6f2; }
+        .tile.value-128 { background: var(--tile-128); color: #f9f6f2; font-size: 1.25rem; }
+        .tile.value-256 { background: var(--tile-256); color: #f9f6f2; font-size: 1.25rem; }
+        .tile.value-512 { background: var(--tile-512); color: #f9f6f2; font-size: 1.25rem; }
+        .tile.value-1024 { background: var(--tile-1024); color: #f9f6f2; font-size: 1rem; }
+        .tile.value-2048 { background: var(--tile-2048); color: #f9f6f2; font-size: 1rem; }
+
+        /* Controls */
+        .controls {
+            margin-top: 24px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .control-buttons {
+            display: flex;
+            gap: 8px;
+        }
+
+        .btn {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 10px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.875rem;
+            font-weight: 500;
+            transition: all 0.15s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .btn:hover {
+            background: var(--bg-hover);
+            border-color: var(--accent);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .btn.primary {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: #fff;
+        }
+
+        .btn.primary:hover {
+            background: #4c8ed9;
+        }
+
+        .step-slider {
+            width: 350px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .step-slider input[type="range"] {
+            flex: 1;
+            height: 6px;
+            -webkit-appearance: none;
+            background: var(--border);
+            border-radius: 3px;
+            outline: none;
+        }
+
+        .step-slider input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 18px;
+            height: 18px;
+            background: var(--accent);
+            border-radius: 50%;
+            cursor: pointer;
+        }
+
+        .step-label {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            min-width: 80px;
+        }
+
+        .speed-control {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+        }
+
+        .speed-control select {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-family: inherit;
+        }
+
+        /* Stats panel */
+        .stats-panel {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            min-width: 300px;
+        }
+
+        .stats-header {
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 16px;
+        }
+
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .stat-row:last-child {
+            border-bottom: none;
+        }
+
+        .stat-label {
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+        }
+
+        .stat-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.875rem;
+            font-weight: 600;
+        }
+
+        .stat-value.positive {
+            color: var(--success);
+        }
+
+        .stat-value.negative {
+            color: #f85149;
+        }
+
+        .stat-value.neutral {
+            color: var(--text-primary);
+        }
+
+        .reward-section {
+            margin-top: 20px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border);
+        }
+
+        .total-reward {
+            font-size: 1.25rem;
+            font-weight: 700;
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid var(--border);
+        }
+
+        /* Loading indicator */
+        .loading {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+        }
+
+        .spinner {
+            width: 16px;
+            height: 16px;
+            border: 2px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Score display */
+        .game-info {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .info-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px 20px;
+            text-align: center;
+        }
+
+        .info-card-label {
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .info-card-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--accent);
+            margin-top: 4px;
+        }
+    </style>
+</head>
+<body>
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <h1>2048 Visualizer</h1>
+            <p>Training run explorer</p>
+        </div>
+        <div class="checkpoint-list" id="checkpointList">
+            <div class="loading">
+                <div class="spinner"></div>
+                <span>Loading checkpoints...</span>
+            </div>
+        </div>
+    </aside>
+
+    <main class="main">
+        <div class="empty-state" id="emptyState">
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2" />
+            </svg>
+            <p>Select a checkpoint to visualize</p>
+        </div>
+
+        <div class="game-container" id="gameContainer" style="display: none;">
+            <div class="board-section">
+                <div class="game-info">
+                    <div class="info-card">
+                        <div class="info-card-label">Training Step</div>
+                        <div class="info-card-value" id="trainingStep">-</div>
+                    </div>
+                    <div class="info-card">
+                        <div class="info-card-label">Final Score</div>
+                        <div class="info-card-value" id="finalScore">-</div>
+                    </div>
+                    <div class="info-card">
+                        <div class="info-card-label">Game Moves</div>
+                        <div class="info-card-value" id="totalMoves">-</div>
+                    </div>
+                </div>
+
+                <div class="action-indicator" id="actionIndicator">
+                    <span class="action-arrow" id="actionArrow"></span>
+                    <span id="actionText">-</span>
+                </div>
+
+                <div class="game-board" id="gameBoard"></div>
+
+                <div class="controls">
+                    <div class="step-slider">
+                        <span class="step-label" id="stepLabel">Step 0 / 0</span>
+                        <input type="range" id="stepSlider" min="0" max="100" value="0">
+                    </div>
+                    <div class="control-buttons">
+                        <button class="btn" id="btnFirst" title="First step">⏮</button>
+                        <button class="btn" id="btnPrev" title="Previous step">◀</button>
+                        <button class="btn primary" id="btnPlay" title="Play/Pause">▶ Play</button>
+                        <button class="btn" id="btnNext" title="Next step">▶</button>
+                        <button class="btn" id="btnLast" title="Last step">⏭</button>
+                    </div>
+                    <div class="speed-control">
+                        <span>Speed:</span>
+                        <select id="speedSelect">
+                            <option value="2000">0.5x</option>
+                            <option value="1000">1x</option>
+                            <option value="500" selected>2x</option>
+                            <option value="250">4x</option>
+                            <option value="100">10x</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+
+            <div class="stats-panel">
+                <div class="stats-header">Move Details</div>
+                <div class="stat-row">
+                    <span class="stat-label">Points Earned</span>
+                    <span class="stat-value neutral" id="statPoints">-</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Entropy</span>
+                    <span class="stat-value neutral" id="statEntropy">-</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Advantage</span>
+                    <span class="stat-value" id="statAdvantage">-</span>
+                </div>
+
+                <div class="reward-section">
+                    <div class="stats-header">Reward Breakdown</div>
+                    <div id="rewardBreakdown"></div>
+                    <div class="stat-row total-reward">
+                        <span class="stat-label">Total Reward</span>
+                        <span class="stat-value" id="statTotal">-</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        // State
+        let currentData = null;
+        let currentStep = 0;
+        let isPlaying = false;
+        let playInterval = null;
+        let playSpeed = 500;
+
+        // Elements
+        const checkpointList = document.getElementById('checkpointList');
+        const emptyState = document.getElementById('emptyState');
+        const gameContainer = document.getElementById('gameContainer');
+        const gameBoard = document.getElementById('gameBoard');
+        const stepSlider = document.getElementById('stepSlider');
+        const stepLabel = document.getElementById('stepLabel');
+        const actionIndicator = document.getElementById('actionIndicator');
+        const actionArrow = document.getElementById('actionArrow');
+        const actionText = document.getElementById('actionText');
+        const btnPlay = document.getElementById('btnPlay');
+        const speedSelect = document.getElementById('speedSelect');
+
+        // Arrow symbols for directions
+        const arrows = {
+            'UP': '↑',
+            'DOWN': '↓',
+            'LEFT': '←',
+            'RIGHT': '→'
+        };
+
+        // Initialize board tiles
+        function initBoard() {
+            gameBoard.innerHTML = '';
+            for (let i = 0; i < 16; i++) {
+                const tile = document.createElement('div');
+                tile.className = 'tile';
+                tile.id = `tile-${i}`;
+                gameBoard.appendChild(tile);
+            }
+        }
+
+        // Render board state
+        function renderBoard(grid) {
+            if (!grid || grid.length !== 4) return;
+            
+            for (let row = 0; row < 4; row++) {
+                for (let col = 0; col < 4; col++) {
+                    const idx = row * 4 + col;
+                    const tile = document.getElementById(`tile-${idx}`);
+                    const value = grid[row][col];
+                    
+                    // Reset classes
+                    tile.className = 'tile';
+                    
+                    if (value === 0) {
+                        tile.textContent = '';
+                    } else {
+                        tile.textContent = value;
+                        tile.classList.add(`value-${value}`);
+                    }
+                }
+            }
+        }
+
+        // Update stats panel
+        function updateStats(move) {
+            if (!move) {
+                document.getElementById('statPoints').textContent = '-';
+                document.getElementById('statEntropy').textContent = '-';
+                document.getElementById('statAdvantage').textContent = '-';
+                document.getElementById('statAdvantage').className = 'stat-value neutral';
+                document.getElementById('rewardBreakdown').innerHTML = '';
+                document.getElementById('statTotal').textContent = '-';
+                return;
+            }
+
+            document.getElementById('statPoints').textContent = move.points_earned || 0;
+            
+            // Display entropy (model's uncertainty)
+            const entropy = move.entropy !== undefined ? move.entropy.toFixed(3) : '-';
+            document.getElementById('statEntropy').textContent = entropy;
+            
+            // Display advantage
+            const advantage = move.advantage !== undefined ? move.advantage : 0;
+            const advClass = advantage > 0 ? 'positive' : advantage < 0 ? 'negative' : 'neutral';
+            const advDisplay = advantage >= 0 ? `+${advantage.toFixed(2)}` : advantage.toFixed(2);
+            document.getElementById('statAdvantage').textContent = advDisplay;
+            document.getElementById('statAdvantage').className = `stat-value ${advClass}`;
+
+            const rewards = move.rewards || {};
+            let html = '';
+            let total = 0;
+
+            const rewardLabels = {
+                points: 'Points',
+                smoothness: 'Smoothness',
+                tile_bonus: 'Tile Bonus',
+                corner: 'Corner',
+                adjacency: 'Adjacency',
+                chain: 'Chain',
+                topological: 'Topological'
+            };
+
+            for (const [key, value] of Object.entries(rewards)) {
+                total += value;
+                const valueClass = value > 0 ? 'positive' : value < 0 ? 'negative' : 'neutral';
+                const displayValue = value >= 0 ? `+${value.toFixed(1)}` : value.toFixed(1);
+                html += `
+                    <div class="stat-row">
+                        <span class="stat-label">${rewardLabels[key] || key}</span>
+                        <span class="stat-value ${valueClass}">${displayValue}</span>
+                    </div>
+                `;
+            }
+
+            document.getElementById('rewardBreakdown').innerHTML = html;
+            
+            const totalClass = total > 0 ? 'positive' : total < 0 ? 'negative' : 'neutral';
+            const totalDisplay = total >= 0 ? `+${total.toFixed(1)}` : total.toFixed(1);
+            document.getElementById('statTotal').textContent = totalDisplay;
+            document.getElementById('statTotal').className = `stat-value ${totalClass}`;
+        }
+
+        // Update display for current step
+        function updateDisplay() {
+            if (!currentData || !currentData.moves) return;
+
+            const moves = currentData.moves;
+            const maxStep = moves.length;
+
+            stepSlider.max = maxStep;
+            stepSlider.value = currentStep;
+            stepLabel.textContent = `Step ${currentStep} / ${maxStep}`;
+
+            if (currentStep === 0) {
+                // Show initial state (before first move)
+                if (moves[0] && moves[0].state_before) {
+                    renderBoard(moves[0].state_before);
+                }
+                actionArrow.textContent = '';
+                actionText.textContent = 'Initial State';
+                updateStats(null);
+            } else {
+                const move = moves[currentStep - 1];
+                if (move) {
+                    renderBoard(move.state_after);
+                    actionArrow.textContent = arrows[move.action] || '';
+                    actionText.textContent = move.action;
+                    updateStats(move);
+                }
+            }
+
+            // Update button states
+            document.getElementById('btnFirst').disabled = currentStep === 0;
+            document.getElementById('btnPrev').disabled = currentStep === 0;
+            document.getElementById('btnNext').disabled = currentStep >= maxStep;
+            document.getElementById('btnLast').disabled = currentStep >= maxStep;
+        }
+
+        // Load checkpoint data
+        async function loadCheckpoint(filename) {
+            try {
+                const response = await fetch(`/api/data/${filename}`);
+                if (!response.ok) throw new Error('Failed to load checkpoint');
+                
+                currentData = await response.json();
+                currentStep = 0;
+                
+                // Update UI
+                emptyState.style.display = 'none';
+                gameContainer.style.display = 'flex';
+                
+                document.getElementById('trainingStep').textContent = currentData.step;
+                document.getElementById('finalScore').textContent = currentData.score;
+                document.getElementById('totalMoves').textContent = currentData.total_steps;
+                
+                initBoard();
+                updateDisplay();
+                
+                // Update active checkpoint in sidebar
+                document.querySelectorAll('.checkpoint-item').forEach(item => {
+                    item.classList.remove('active');
+                    if (item.dataset.filename === filename) {
+                        item.classList.add('active');
+                    }
+                });
+            } catch (error) {
+                console.error('Error loading checkpoint:', error);
+            }
+        }
+
+        // Fetch and render checkpoint list
+        async function fetchCheckpoints() {
+            try {
+                const response = await fetch('/api/files');
+                const data = await response.json();
+                
+                if (data.files.length === 0) {
+                    checkpointList.innerHTML = `
+                        <div style="padding: 20px; text-align: center; color: var(--text-secondary);">
+                            <p style="font-size: 0.875rem;">No checkpoints found</p>
+                            <p style="font-size: 0.75rem; margin-top: 8px;">
+                                Run training with --viz-dir to generate data
+                            </p>
+                        </div>
+                    `;
+                    return;
+                }
+                
+                // Sort by step number (descending)
+                data.files.sort((a, b) => b.step - a.step);
+                
+                checkpointList.innerHTML = data.files.map(file => `
+                    <div class="checkpoint-item" data-filename="${file.filename}" onclick="loadCheckpoint('${file.filename}')">
+                        <div class="checkpoint-step">Step ${file.step}</div>
+                        <div class="checkpoint-meta">
+                            Score: <span class="checkpoint-score">${file.score}</span> | 
+                            ${file.total_steps} moves
+                        </div>
+                    </div>
+                `).join('');
+            } catch (error) {
+                console.error('Error fetching checkpoints:', error);
+                checkpointList.innerHTML = `
+                    <div style="padding: 20px; color: #f85149;">
+                        Error connecting to server
+                    </div>
+                `;
+            }
+        }
+
+        // Playback controls
+        function togglePlay() {
+            isPlaying = !isPlaying;
+            
+            if (isPlaying) {
+                btnPlay.innerHTML = '⏸ Pause';
+                playInterval = setInterval(() => {
+                    if (currentData && currentStep < currentData.moves.length) {
+                        currentStep++;
+                        updateDisplay();
+                    } else {
+                        stopPlay();
+                    }
+                }, playSpeed);
+            } else {
+                stopPlay();
+            }
+        }
+
+        function stopPlay() {
+            isPlaying = false;
+            btnPlay.innerHTML = '▶ Play';
+            if (playInterval) {
+                clearInterval(playInterval);
+                playInterval = null;
+            }
+        }
+
+        // Event listeners
+        document.getElementById('btnFirst').onclick = () => {
+            stopPlay();
+            currentStep = 0;
+            updateDisplay();
+        };
+
+        document.getElementById('btnPrev').onclick = () => {
+            stopPlay();
+            if (currentStep > 0) {
+                currentStep--;
+                updateDisplay();
+            }
+        };
+
+        document.getElementById('btnNext').onclick = () => {
+            stopPlay();
+            if (currentData && currentStep < currentData.moves.length) {
+                currentStep++;
+                updateDisplay();
+            }
+        };
+
+        document.getElementById('btnLast').onclick = () => {
+            stopPlay();
+            if (currentData) {
+                currentStep = currentData.moves.length;
+                updateDisplay();
+            }
+        };
+
+        btnPlay.onclick = togglePlay;
+
+        stepSlider.oninput = () => {
+            stopPlay();
+            currentStep = parseInt(stepSlider.value);
+            updateDisplay();
+        };
+
+        speedSelect.onchange = () => {
+            playSpeed = parseInt(speedSelect.value);
+            if (isPlaying) {
+                stopPlay();
+                togglePlay();
+            }
+        };
+
+        // Keyboard controls
+        document.addEventListener('keydown', (e) => {
+            if (!currentData) return;
+            
+            switch(e.key) {
+                case 'ArrowLeft':
+                    document.getElementById('btnPrev').click();
+                    break;
+                case 'ArrowRight':
+                    document.getElementById('btnNext').click();
+                    break;
+                case ' ':
+                    e.preventDefault();
+                    togglePlay();
+                    break;
+                case 'Home':
+                    document.getElementById('btnFirst').click();
+                    break;
+                case 'End':
+                    document.getElementById('btnLast').click();
+                    break;
+            }
+        });
+
+        // Initialize
+        fetchCheckpoints();
+        
+        // Poll for new checkpoints every 2 seconds
+        setInterval(fetchCheckpoints, 2000);
+    </script>
+</body>
+</html>
+
