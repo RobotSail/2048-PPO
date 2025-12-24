@@ -4,9 +4,11 @@ type Grid = list[list[int]]
 from enum import Enum
 import random
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.functional import scaled_dot_product_attention
 
 
 class Direction(Enum):
@@ -23,6 +25,20 @@ class MLPConfig(BaseModel):
     hidden_dim: int = 64
     num_layers: int = 2
     dropout: float = 0.1
+
+
+class GameURMConfig(BaseModel):
+    """Configuration for the Universal Reasoning Model adapted for 2048 game."""
+
+    hidden_dim: int = 64
+    num_layers: int = 2  # Number of transformer blocks
+    num_heads: int = 4
+    expansion: float = 2.67  # MLP expansion factor (SwiGLU uses 2/3 of this)
+    dropout: float = 0.1
+    num_loops: int = 4  # Number of recurrent reasoning loops
+    num_truncated_loops: int = 1  # Loops without gradient (forward-only)
+    conv_kernel: int = 2  # Short convolution kernel size
+    rms_norm_eps: float = 1e-5
 
 
 class Game2048:
@@ -593,7 +609,81 @@ class Game2048:
         return min(corners, key=lambda c: abs(c[0] - target[0]) + abs(c[1] - target[1]))
 
     @staticmethod
-    def topological_score(grid: Grid, anchor_corner: tuple[int, int] | None = None) -> float:
+    def monotonicity(grid: Grid, require_corner_max: bool = False) -> int:
+        """
+        Calculate a game's monotonicity score by evaluating how well tiles
+        are arranged in monotonically increasing/decreasing sequences.
+
+        The algorithm checks all four rotations of the board (0°, 90°, 180°, 270°)
+        and returns the best monotonicity score found.
+
+        For each rotation, it counts how many adjacent pairs satisfy the
+        monotonicity condition (left >= right and top >= bottom).
+
+        Args:
+            grid: The game board state.
+            require_corner_max: If True (default), applies a penalty when the
+                maximum tile is not in a corner. Per the original algorithm
+                description, high monotonicity requires the max tile to be in
+                a corner. When enabled, the score is halved if max is not in
+                a corner.
+
+        Returns the highest score across all rotations (potentially penalized).
+        """
+        best = -1
+
+        # Try all 4 rotations (0°, 90°, 180°, 270°)
+        current_grid = [row[:] for row in grid]
+
+        for rotation in range(4):
+            current = 0
+
+            # Check horizontal monotonicity (left to right)
+            # only count pairs where both cells have tiles (skip empty cells)
+            for row in range(GRID_SIZE):
+                for col in range(GRID_SIZE - 1):
+                    left = current_grid[row][col]
+                    right = current_grid[row][col + 1]
+                    if left > 0 and right > 0 and left >= right:
+                        current += 1
+
+            # Check vertical monotonicity (top to bottom)
+            for col in range(GRID_SIZE):
+                for row in range(GRID_SIZE - 1):
+                    top = current_grid[row][col]
+                    bottom = current_grid[row + 1][col]
+                    if top > 0 and bottom > 0 and top >= bottom:
+                        current += 1
+
+            if current > best:
+                best = current
+
+            # Rotate the board 90 degrees clockwise for next iteration
+            current_grid = [
+                [current_grid[GRID_SIZE - 1 - j][i] for j in range(GRID_SIZE)]
+                for i in range(GRID_SIZE)
+            ]
+
+        if require_corner_max:
+            # check if max tile is in one of the four corners
+            max_val = max(max(row) for row in grid)
+            corners = [
+                (0, 0),
+                (0, GRID_SIZE - 1),
+                (GRID_SIZE - 1, 0),
+                (GRID_SIZE - 1, GRID_SIZE - 1),
+            ]
+            max_in_corner = any(grid[r][c] == max_val for r, c in corners)
+
+            if not max_in_corner:
+                best = 0
+
+        return best
+
+    @staticmethod
+    def topological_score(
+        grid: Grid, anchor_corner: tuple[int, int] | None = None
+    ) -> float:
         """
         Calculate a gradient-based topological score.
 
@@ -761,6 +851,9 @@ class Game2048:
                     "corner_delta": 0.0,
                     "adjacency_delta": 0.0,
                     "chain_delta": 0.0,
+                    # "monotonicity_delta": 0.0,
+                    "monotonicity_before": 0.0,
+                    "monotonicity_after": 0.0,
                     "topological_delta": 0.0,
                 },
             )
@@ -770,6 +863,7 @@ class Game2048:
         corner_before = Game2048.corner_bonus(self.grid)
         adjacency_before = Game2048.adjacency_bonus(self.grid)
         chain_before = Game2048.monotonic_chain_score(self.grid)
+        monotonicity_before = Game2048.monotonicity(self.grid)
         anchor_corner = Game2048._choose_anchor_corner(self.grid)
         topological_before = Game2048.topological_score(self.grid, anchor_corner)
         max_exp_before = max(max(row) for row in self.grid)
@@ -784,6 +878,7 @@ class Game2048:
         corner_after = Game2048.corner_bonus(new_grid)
         adjacency_after = Game2048.adjacency_bonus(new_grid)
         chain_after = Game2048.monotonic_chain_score(new_grid)
+        monotonicity_after = Game2048.monotonicity(new_grid)
         topological_after = Game2048.topological_score(new_grid, anchor_corner)
         max_exp_after = max(max(row) for row in new_grid)
 
@@ -804,6 +899,10 @@ class Game2048:
                 "corner_delta": corner_after - corner_before,
                 "adjacency_delta": adjacency_after - adjacency_before,
                 "chain_delta": chain_after - chain_before,
+                # well intentioned but i dont need this
+                # "monotonicity_delta": monotonicity_after - monotonicity_before,
+                "monotonicity_before": monotonicity_before,
+                "monotonicity_after": monotonicity_after,
                 "topological_delta": topological_after - topological_before,
                 "topological_anchor": anchor_corner,
             },
@@ -815,18 +914,15 @@ class ResidualBlock(nn.Module):
 
     def __init__(self, hidden_dim: int, dropout: float = 0.1):
         super().__init__()
-        self.linear = nn.Linear(hidden_dim, hidden_dim)
-        self.ln = nn.LayerNorm(hidden_dim)
-        self.activation = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim, bias=False),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.linear(x)
-        x = self.dropout(x)
-        x = self.ln(x)
-        x = self.activation(x)
-        return x + residual  # skip connection
+        return x + self.mlp(x)  # skip connection
 
 
 class GameMLP(nn.Module):
@@ -847,25 +943,30 @@ class GameMLP(nn.Module):
     def __init__(self, config: MLPConfig) -> None:
         super().__init__()
 
-        # project input to hidden dimension
-        self.proj_up = nn.Linear(
-            in_features=self.N * 3, out_features=config.hidden_dim, bias=True
+        # Stem
+        self.stem = nn.Sequential(
+            nn.Linear(
+                in_features=self.N * 3, out_features=config.hidden_dim, bias=False
+            ),
+            nn.LayerNorm(config.hidden_dim),
+            nn.ReLU(),
         )
-        self.input_ln = nn.LayerNorm(config.hidden_dim)
-        self.input_activation = nn.ReLU()
-        self.input_dropout = nn.Dropout(config.dropout)
 
         # stack of residual blocks
-        self.hidden_layers = nn.ModuleList(
+        self.backbone = nn.ModuleList(
             [
                 ResidualBlock(config.hidden_dim, config.dropout)
                 for _ in range(config.num_layers)
             ]
         )
 
-        # project to action logits (no LayerNorm on output to allow confident predictions)
-        self.proj_down = nn.Linear(
+        # action head
+        self.action_head = nn.Linear(
             in_features=config.hidden_dim, out_features=self.NUM_ACTIONS, bias=True
+        )
+        # value head
+        self.value_head = nn.Linear(
+            in_features=config.hidden_dim, out_features=1, bias=True
         )
 
         self.apply(GameMLP.init_kaiming)
@@ -880,10 +981,7 @@ class GameMLP(nn.Module):
     def forward(
         self,
         inputs: torch.Tensor,
-        targets: torch.Tensor | None = None,
-        action_mask: torch.Tensor | None = None,
-        reduction: str = "mean",
-    ) -> tuple[torch.Tensor, None | torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         f"""
         Given the set of inputs in $R^{16}$, returns a probability function over the action
         space and optionally a loss if targets were specified
@@ -929,32 +1027,272 @@ class GameMLP(nn.Module):
 
         # project input to hidden dimension
         x = inputs.to(dtype=torch.float32)  # (B, N*3)
-        x = self.proj_up(x)  # (B, H)
-        x = self.input_dropout(x)
-        x = self.input_ln(x)
-        x = self.input_activation(x)
+        x = self.stem(x)
 
         # pass through residual blocks
-        for layer in self.hidden_layers:
+        for layer in self.backbone:
             x = layer(x)
 
         # project to action logits
-        x = self.proj_down(x)  # (B, NUM_ACTIONS)
+        action_logits = self.action_head(x)  # (B, NUM_ACTIONS)
+        value_logit = self.value_head(x)
 
         # now we normalize to logits
-        loss = None
-        if targets is not None:
-            targets = targets.to(device=x.device)
+        # loss = None
+        # if targets is not None:
+        #     targets = targets.to(device=action_logits.device)
 
-            # convert (B, T) into (B x T)
-            targets = targets.view(-1)
-            x[action_mask] = -torch.inf  # mask to kill the training signal
+        #     # convert (B, T) into (B x T)
+        #     targets = targets.view(-1)
+        #     x[action_mask] = -torch.inf  # mask to kill the training signal
 
-            # compute the loss here
-            loss = F.cross_entropy(input=x, target=targets, reduction=reduction)
+        #     # compute the loss here
+        #     loss = F.cross_entropy(
+        #         input=action_logits, target=targets, reduction=reduction
+        #     )
 
-        # returns the raw logits + loss (if applicable)
-        return (x, loss)
+        # # returns the raw logits + loss (if applicable)
+        return (action_logits, value_logit)
+
+
+def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tensor:
+    """RMS normalization without learnable parameters."""
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    variance = hidden_states.square().mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
+    return hidden_states.to(input_dtype)
+
+
+class GameConvSwiGLU(nn.Module):
+    """
+    SwiGLU with depthwise short convolution for local context mixing.
+
+    This is the key innovation from URM: adds a 1D depthwise convolution
+    after the gated activation to inject local token interactions.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        expansion: float,
+        conv_kernel: int = 2,
+    ):
+        super().__init__()
+        # Calculate intermediate size (SwiGLU uses 2/3 of expansion)
+        inter = round(expansion * hidden_size * 2 / 3)
+        # Round up to multiple of 8 for efficiency
+        inter = ((inter + 7) // 8) * 8
+        self.inter = inter
+
+        self.gate_up_proj = nn.Linear(hidden_size, inter * 2, bias=False)
+        self.dwconv = nn.Conv1d(
+            in_channels=inter,
+            out_channels=inter,
+            kernel_size=conv_kernel,
+            padding=conv_kernel // 2,
+            groups=inter,  # Depthwise: each channel has its own kernel
+            bias=True,
+        )
+        self.down_proj = nn.Linear(inter, hidden_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq_len, hidden_size)
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        x_ffn = F.silu(gate) * up  # SwiGLU gating
+
+        # Apply depthwise convolution for local mixing
+        # (batch, seq, inter) -> (batch, inter, seq) for conv1d
+        x_conv = self.dwconv(x_ffn.transpose(1, 2))
+        x_conv = x_conv[..., : x_ffn.size(1)]  # Trim to original seq length
+        x_conv = F.silu(x_conv)  # Additional nonlinearity after conv
+        x_conv = x_conv.transpose(1, 2).contiguous()
+
+        return self.down_proj(x_conv)
+
+
+class GameURMAttention(nn.Module):
+    """
+    Multi-head self-attention for the 2048 game board.
+
+    Uses scaled dot-product attention (no causal masking needed for 2048).
+    """
+
+    def __init__(self, hidden_size: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.dropout = dropout
+
+        self.qkv_proj = nn.Linear(hidden_size, hidden_size * 3, bias=False)
+        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = hidden_states.shape
+
+        # Project to Q, K, V
+        qkv = self.qkv_proj(hidden_states)
+        qkv = qkv.view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, batch, heads, seq, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # Scaled dot-product attention (no causal mask for 2048)
+        attn_output = scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False,
+        )
+
+        # Reshape and project output
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(batch_size, seq_len, self.hidden_size)
+        return self.o_proj(attn_output)
+
+
+class GameURMBlock(nn.Module):
+    """
+    A single URM transformer block with attention + ConvSwiGLU.
+
+    Architecture:
+        x -> Attention -> + -> RMSNorm -> ConvSwiGLU -> + -> RMSNorm -> out
+             └──────────┘              └───────────────┘
+    """
+
+    def __init__(self, config: GameURMConfig):
+        super().__init__()
+        self.attn = GameURMAttention(
+            hidden_size=config.hidden_dim,
+            num_heads=config.num_heads,
+            dropout=config.dropout,
+        )
+        self.mlp = GameConvSwiGLU(
+            hidden_size=config.hidden_dim,
+            expansion=config.expansion,
+            conv_kernel=config.conv_kernel,
+        )
+        self.norm_eps = config.rms_norm_eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Pre-norm attention with residual
+        attn_output = self.attn(hidden_states)
+        hidden_states = rms_norm(hidden_states + attn_output, self.norm_eps)
+
+        # Pre-norm MLP with residual
+        mlp_output = self.mlp(hidden_states)
+        hidden_states = rms_norm(hidden_states + mlp_output, self.norm_eps)
+
+        return hidden_states
+
+
+class GameURM(nn.Module):
+    """
+    Universal Reasoning Model adapted for the 2048 game.
+
+    This implements the key URM innovations:
+    1. Recurrent loops: Same transformer blocks applied multiple times
+    2. ConvSwiGLU: SwiGLU MLP with short convolution for local context
+    3. Truncated backprop: First N loops are forward-only (no gradients)
+
+    Input: (batch, 48) tensor with 16 cells × 3 features (value, row_idx, col_idx)
+    Output: (action_logits, value_logit) tuple
+    """
+
+    N = 16  # Grid size (4x4 = 16 cells)
+    NUM_ACTIONS = 4
+
+    def __init__(self, config: GameURMConfig):
+        super().__init__()
+        self.config = config
+
+        # Input projection: 3 features per cell -> hidden_dim
+        self.stem = nn.Sequential(
+            nn.Linear(3, config.hidden_dim, bias=False),
+            nn.LayerNorm(config.hidden_dim),
+            nn.SiLU(),
+        )
+
+        # Stack of URM transformer blocks (reused in recurrent loops)
+        self.layers = nn.ModuleList(
+            [GameURMBlock(config) for _ in range(config.num_layers)]
+        )
+
+        # Learnable initial hidden state for recurrent loops
+        self.init_hidden = nn.Parameter(torch.zeros(1, self.N, config.hidden_dim))
+        nn.init.trunc_normal_(self.init_hidden, std=0.02)
+
+        # Action head: pool over sequence -> 4 actions
+        self.action_head = nn.Linear(config.hidden_dim, self.NUM_ACTIONS, bias=True)
+
+        # Value head: pool over sequence -> 1 value
+        self.value_head = nn.Linear(config.hidden_dim, 1, bias=True)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_uniform_(module.weight, nonlinearity="relu")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+    @property
+    def directions(self) -> list[Direction]:
+        """Direction order matching output logits."""
+        return [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT]
+
+    def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass with recurrent reasoning loops.
+
+        Args:
+            inputs: (batch, 48) tensor with cell features
+
+        Returns:
+            (action_logits, value_logit) tuple
+        """
+        if inputs.ndim == 1:
+            inputs = inputs.unsqueeze(0)
+
+        batch_size = inputs.shape[0]
+
+        # Reshape: (batch, 48) -> (batch, 16, 3)
+        x = inputs.view(batch_size, self.N, 3)
+
+        # Project input to hidden dimension
+        input_embeddings = self.stem(x)  # (batch, 16, hidden_dim)
+
+        # Initialize hidden state (expand for batch)
+        hidden_states = self.init_hidden.expand(batch_size, -1, -1).clone()
+
+        # Recurrent reasoning loops with truncated backprop
+        total_loops = self.config.num_loops
+        truncated_loops = self.config.num_truncated_loops
+
+        # Phase 1: Truncated loops (forward-only, no gradients)
+        if truncated_loops > 0:
+            with torch.no_grad():
+                for _ in range(truncated_loops):
+                    hidden_states = hidden_states + input_embeddings
+                    for layer in self.layers:
+                        hidden_states = layer(hidden_states)
+
+        # Phase 2: Remaining loops with gradients
+        for _ in range(total_loops - truncated_loops):
+            hidden_states = hidden_states + input_embeddings
+            for layer in self.layers:
+                hidden_states = layer(hidden_states)
+
+        # Pool over sequence dimension (mean pooling)
+        pooled = hidden_states.mean(dim=1)  # (batch, hidden_dim)
+
+        # Output heads
+        action_logits = self.action_head(pooled)
+        value_logit = self.value_head(pooled)
+
+        return action_logits, value_logit
 
 
 def generate_random_games(n=1) -> list[Game2048]:
@@ -977,7 +1315,25 @@ if __name__ == "__main__":
 
     stacked = torch.stack(boards)
 
+    print("=== Testing GameMLP ===")
     model = GameMLP(MLPConfig(hidden_dim=64))
-    logits, _ = model(stacked)
+    logits, value = model(stacked)
+    print(f"Action logits shape: {logits.shape}")
+    print(f"Value shape: {value.shape}")
+    print(f"Action logits:\n{logits}")
 
-    print(logits)
+    print("\n=== Testing GameURM ===")
+    urm_model = GameURM(
+        GameURMConfig(hidden_dim=64, num_loops=4, num_truncated_loops=1)
+    )
+    urm_logits, urm_value = urm_model(stacked)
+    print(f"Action logits shape: {urm_logits.shape}")
+    print(f"Value shape: {urm_value.shape}")
+    print(f"Action logits:\n{urm_logits}")
+
+    # Compare parameter counts
+    mlp_params = sum(p.numel() for p in model.parameters())
+    urm_params = sum(p.numel() for p in urm_model.parameters())
+    print(f"\n=== Parameter Counts ===")
+    print(f"GameMLP: {mlp_params:,} parameters")
+    print(f"GameURM: {urm_params:,} parameters")

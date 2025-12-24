@@ -14,10 +14,11 @@ from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
 import torch
 from torch.optim import AdamW
+from torch.nn import functional as F
 from tqdm import tqdm
 
 
-from game import Game2048, Direction, GameMLP, MLPConfig
+from game import Game2048, Direction, GameMLP, MLPConfig, GameURM, GameURMConfig
 
 app = typer.Typer(help="Train and evaluate 2048 AI agents")
 
@@ -54,7 +55,7 @@ def format_grid(grid: list[list[int]], indent: str = "  ") -> str:
 
 @torch.no_grad
 def play_game_for_episode(
-    model: GameMLP, max_steps: int | None = None, device: torch.device = None
+    model: torch.nn.Module, max_steps: int | None = None, device: torch.device = None
 ) -> dict:
     """
     Given a model, play an episode of a game.
@@ -95,7 +96,7 @@ def play_game_for_episode(
         model_input = game.to_model_format()
         if device is not None:
             model_input = model_input.to(device)
-        logits, _ = model(model_input.unsqueeze(0))
+        action_logits, predicted_future_value = model(model_input.unsqueeze(0))
 
         # we interret the directions as being UP/DOWN/LEFT/RIGHT:
         dirs = [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT]
@@ -103,14 +104,21 @@ def play_game_for_episode(
         invalid_mask = [_dir not in valid_dirs for _dir in dirs]
 
         # extract the action sequence & mask out invalid states
-        action_probs = logits[-1]
+        action_probs = action_logits[-1]
         action_probs[invalid_mask] = -torch.inf
 
         # now we let the model decide which direction it should move into
         adjusted_action_dist = torch.softmax(
             action_probs, dim=0
         )  # this is the one we want to save
-        selected_action = torch.multinomial(adjusted_action_dist, num_samples=1).item()
+        try:
+            selected_action = torch.multinomial(
+                adjusted_action_dist, num_samples=1
+            ).item()
+        except RuntimeError:
+            from IPython import embed
+
+            embed()
         action: Direction = model.directions[selected_action]
 
         # compute entropy of the action distribution (model's uncertainty)
@@ -138,8 +146,9 @@ def play_game_for_episode(
         # total_reward_corrected = total_reward / (1 - momentum ** (step + 1))
 
         # and then this determines which action was actually selected
+        step_data["predicted_future_value"] = predicted_future_value.detach().item()
         step_data["selected_direction"] = selected_action
-        step_data["game_state"] = model_input
+        step_data["game_state"] = model_input.detach()
         step_data["state_before"] = state_before  # raw grid before move
         step_data["result_state"] = new_state  # state after the move
         step_data["max_points_possible"] = highest_points
@@ -153,6 +162,9 @@ def play_game_for_episode(
         step_data["corner_delta"] = info.get("corner_delta", 0.0)
         step_data["adjacency_delta"] = info.get("adjacency_delta", 0.0)
         step_data["chain_delta"] = info.get("chain_delta", 0.0)
+        # step_data["monotonicity_delta"] = info.get("monotonicity_delta", 0.0)
+        step_data["monotonicity_after"] = info.get("monotonicity_after", 0.0)
+        step_data["monotonicity_before"] = info.get("monotonicity_before", 0.0)
         step_data["topological_delta"] = info.get("topological_delta", 0.0)
         step_data["topological_anchor"] = info.get("topological_anchor")
         step_data["entropy"] = step_entropy
@@ -192,10 +204,11 @@ def _worker_play_game(args: tuple) -> dict:
 
 
 def model_optimize_step(
-    model: GameMLP,
+    model: torch.nn.Module,
     episodes: list[dict],
     optimizer: torch.optim.Optimizer,
     beta: float = 0.1,
+    critic_strength: float = 1.0,
     device: torch.device = None,
 ):
     """
@@ -212,7 +225,13 @@ def model_optimize_step(
             direction_idx = torch.tensor([move["selected_direction"]])
             action_mask = move["action_mask"]
             minibatch.append(
-                (input_state, direction_idx, action_mask, move["advantage"])
+                (
+                    input_state,
+                    direction_idx,
+                    action_mask,
+                    move["advantage"],
+                    move["future_reward"],
+                )
             )
 
     # now we create a single batched input tensor
@@ -220,6 +239,7 @@ def model_optimize_step(
     target_batch = torch.stack([item[1] for item in minibatch])
     action_mask = torch.tensor([item[2] for item in minibatch])
     advantage = torch.tensor([item[3] for item in minibatch], dtype=torch.float32)
+    vtg_batch = torch.tensor([item[4] for item in minibatch])
 
     if device is not None:
         input_batch = input_batch.to(device)
@@ -227,62 +247,38 @@ def model_optimize_step(
         action_mask = action_mask.to(device)
         advantage = advantage.to(device)
 
-    # batches += [
-    #     {
-    #         "inputs": input_batch,
-    #         "target_batch": target_batch,
-    #         "advantage": ep["advantage"],
-    #     }
-    # ]
-
     # now that the data is prepared, we compute the loss and take an optimizer step
     model.train()
-    # for batch in batches:
-    #     loss = None
-    #     inputs = batch["inputs"]
-    #     targets = batch["target_batch"]
-    #     advantage = batch["advantage"]
 
-    #     _, loss = model(inputs=inputs, targets=targets)
-    #     loss *= advantage
-
-    #     loss /= len(batches)
-    #     with torch.no_grad():
-    #         total_loss += loss
-
-    #     # now we backprop
-    #     loss.backward()
-
-    # loss = None
-    # targets = batch["target_batch"]
-    # advantage = batch["advantage"]
-
-    logits, unreduced_loss = model(
+    action_logits, value_logits = model(
         inputs=input_batch,
-        targets=target_batch,
-        action_mask=action_mask,
-        reduction="none",
     )
-    unreduced_loss *= advantage
 
-    # compute entropy here
-    masked_probs = torch.softmax(logits, dim=1)
-    entropy = -(masked_probs * (masked_probs + 1e-8).log()).sum(dim=1)
+    targets = target_batch.to(device=action_logits.device)
 
-    unreduced_loss -= beta * entropy
+    # convert (B, T) into (B x T)
+    targets = targets.view(-1)
+    action_logits[action_mask] = -torch.inf  # mask to kill the training signal
 
-    loss = unreduced_loss.sum() / unreduced_loss.numel()
-    num_valid = (~action_mask).sum(dim=1).float().mean()
-    # print(f" actions: {num_valid:.2f}")
+    # compute the advantaged cross-entropy loss
+    policy_loss_per_sample = F.cross_entropy(
+        input=action_logits, target=targets, reduction="none"
+    )
+    policy_loss_per_sample *= advantage
+    policy_loss = policy_loss_per_sample.mean()
 
-    # # now we also add entropy to the loss
-    # from IPython import embed
+    # entropy regularization
+    masked_probs = torch.softmax(action_logits, dim=1)
+    entropy_per_sample = -(masked_probs * (masked_probs + 1e-8).log()).sum(dim=1)
+    entropy_loss = -beta * entropy_per_sample.mean()
 
-    # embed()
+    # value loss for the learned baseline
+    value_logits = value_logits.view(-1)
+    value_loss_per_sample = F.huber_loss(value_logits, vtg_batch, reduction="none")
+    value_loss = critic_strength * value_loss_per_sample.mean()
 
-    # import sys
-
-    # sys.exit()
+    # combine all losses
+    loss = policy_loss + entropy_loss + value_loss
 
     # now we backprop
     loss.backward()
@@ -292,14 +288,14 @@ def model_optimize_step(
     optimizer.step()
     optimizer.zero_grad()
 
-    # # returns the gradnorm
-    # from IPython import embed
-
-    # embed()
+    # collect stats for logging
     stats = {
         "loss": loss.detach().cpu().item(),
+        "policy_loss": policy_loss.detach().cpu().item(),
+        "entropy_loss": entropy_loss.detach().cpu().item(),
+        "value_loss": value_loss.detach().cpu().item(),
         "grad_norm": grad_norm,
-        "entropy": torch.e ** (loss.item()),
+        "entropy": entropy_per_sample.mean().detach().cpu().item(),
     }
     return stats
 
@@ -312,13 +308,14 @@ def model_optimize_step(
 
 def calculate_advantage(
     episodes: list[dict],
-    gamma: float,
+    discount_rate: float,
     points_weight: float = 1.0,
     smoothness_weight: float = 1.0,
     max_tile_weight: float = 1.0,
     corner_weight: float = 1.0,
     adjacency_weight: float = 1.0,
     chain_weight: float = 1.0,
+    monotonicity_weight: float = 1.0,
     topological_weight: float = 1.0,
     win_bonus: float = 1000.0,
 ):
@@ -331,6 +328,7 @@ def calculate_advantage(
              + corner_weight * corner_delta
              + adjacency_weight * adjacency_delta
              + chain_weight * chain_delta
+             + monotonicity_weight * monotonicity_delta
              + topological_weight * topological_delta
              + win_bonus (one-time when 2048 tile is created)
 
@@ -340,6 +338,7 @@ def calculate_advantage(
     - corner_delta rewards keeping the max tile in a corner
     - adjacency_delta rewards high-value tiles being adjacent to each other
     - chain_delta rewards building monotonically decreasing chains from max tile
+    - monotonicity_delta rewards consistent increase/decrease patterns
     - topological_delta rewards proper tile organization (neighbors, gaps, density)
     - win_bonus is a one-time reward for creating the 2048 tile (exponent 11)
     """
@@ -349,85 +348,66 @@ def calculate_advantage(
     # first we calculate the reward of each step
     for ep in episodes:
         for move in ep["moves"]:
-            # combine merge points with board quality improvement
+            # # combine merge points with board quality improvement
             points_reward = move["points_earned"] * points_weight
-            smoothness_reward = move.get("smoothness_delta", 0.0) * smoothness_weight
-            tile_bonus = move.get("max_tile_created", 0) * max_tile_weight
-            corner_bonus = move.get("corner_delta", 0.0) * corner_weight
-            adjacency_bonus = move.get("adjacency_delta", 0.0) * adjacency_weight
-            chain_bonus = move.get("chain_delta", 0.0) * chain_weight
-            topological_bonus = move.get("topological_delta", 0.0) * topological_weight
+            # smoothness_reward = move.get("smoothness_delta", 0.0) * smoothness_weight
+            # tile_bonus = move.get("max_tile_created", 0) * max_tile_weight
+            # corner_bonus = move.get("corner_delta", 0.0) * corner_weight
+            # adjacency_bonus = move.get("adjacency_delta", 0.0) * adjacency_weight
+            # chain_bonus = move.get("chain_delta", 0.0) * chain_weight
+            # topological_bonus = move.get("topological_delta", 0.0) * topological_weight
 
             # One-time bonus for creating the 2048 tile (detect first crossing)
-            max_before = move.get("max_exponent_before", 0)
-            max_after = move.get("max_exponent_after", max_before)
-            created_2048 = max_before < WIN_TILE_EXPONENT and max_after >= WIN_TILE_EXPONENT
-            win_reward = win_bonus if created_2048 else 0.0
+            # max_before = move.get("max_exponent_before", 0)
+            # max_after = move.get("max_exponent_after", max_before)
+            # created_2048 = (
+            #     max_before < WIN_TILE_EXPONENT and max_after >= WIN_TILE_EXPONENT
+            # )
+            # # win_reward = win_bonus if created_2048 else 0.0
 
-            move["reward"] = (
-                points_reward
-                + smoothness_reward
-                + tile_bonus
-                + corner_bonus
-                + adjacency_bonus
-                + chain_bonus
-                + topological_bonus
-                + win_reward
+            # Legacy method of pointing, do not use
+            # move["reward"] = points_reward
+            #  All of the below points should strictly be **shaped reward**, and not absolute
+            # + smoothness_reward
+            # + tile_bonus
+            # + corner_bonus
+            # + adjacency_bonus
+            # + chain_bonus
+            # + monotonicity_bonus
+            # + topological_bonus
+            # + win_reward
+
+            # We have two types of rewards: absolute and shaped (PBRS)
+            absolute_reward = (
+                points_reward  # this is what each step gets no matter what
             )
 
-            # if max(move["points_possible"].values()) == 0:
-            #     # this is a tricky case, sometimes it might not be possible to
-            #     # score any points and the model needs to move it around.
-            #     # in these cases, the model should move in a direction which maximizes
-            #     # future reward, e.g. two policies:
-            #     # P1: X + R2 + ... +
-            #     # P2: Y + R2' + ... +
-            #     # so if we want P1 > P2 then we want R2 + ... > R2' + ....
-            #     # in this case if it moves to a worse direction then it wont get the opportunity
-            #     # to make a mistake and so the overall reward should be smaller on average
-            #     # but if it moves into a better direction then it gets an opportunity to score higher
-            #     # where it will either be rewarded or penalized.
-
-            #     # since this move is hard to penalize or reward because wed need to figure out future possible
-            #     # states (can be done via bfs using max_depth=K), lets just keep it as 0 for now
-            #     move["reward"] = 0
-            #     continue
-
-            # # simple case of grading based on what the available moves are
-            # avg_possible_points = sum(move["points_possible"].values()) / 4
-            # worst_case = min(move["points_possible"].values())
-            # best_case = max(move["points_possible"].values())
-
-            # # reward = move["points_earned"] / (best_case - worst_case) * 2
-            # # move["reward"]
-
-            # # simple reward
-            # move["reward"] = (
-            #     (move["points_earned"] - avg_possible_points)
-            #     / (best_case - worst_case)
-            #     * 2
-            # )
+            # Shaped reward, Potential-Based Reward Shaping (PBRS) - only use monotonicity for right now
+            # allows us to provide relative rewawrds within each steps which get cancelled out once
+            # the discounted reward is calculated.
+            shaped_reward = monotonicity_weight * (
+                discount_rate * move["monotonicity_after"] - move["monotonicity_before"]
+            )
+            move["reward"] = absolute_reward + shaped_reward
 
     # next we calculate the discount rate and per-timestep baseline
-    step_returns_by_t: dict[int, list[float]] = defaultdict(list)
     for ep in episodes:
         moves = ep["moves"]
         G = 0.0
         for t in reversed(range(len(moves))):
             move = moves[t]
-            G = move["reward"] + gamma * G
+            G = move["reward"] + discount_rate * G
             move["future_reward"] = G
-            move["t_index"] = t
-            step_returns_by_t[t].append(G)
-
-    baseline_by_t = {
-        t: sum(values) / len(values) for t, values in step_returns_by_t.items()
-    }
 
     # calculate advantage using timestep-specific baselines (no normalization)
     for ep in episodes:
         for m in ep["moves"]:
-            baseline = baseline_by_t.get(m.get("t_index", 0), 0.0)
+            baseline = m["predicted_future_value"]
+            # we want it to be disconnected at this point
+            assert all(
+                not isinstance(v, torch.Tensor) for v in [m["future_reward"], baseline]
+            ), "one of the variables in advantage computation is a tensor"
+
             m["advantage"] = m["future_reward"] - baseline
 
     # Here I tried to use the harmonic mean to get the advantage, but this still doesnt work
@@ -532,6 +512,11 @@ def train(
     beta: float = typer.Option(
         0.1, "--beta", help="Parmaeter for controlling entropy regularization."
     ),
+    critic_strength: float = typer.Option(
+        1.0,
+        "--critic",
+        help="Strength of the critic (estimated reward-to-go) during loss computation",
+    ),
     epsilon: float = typer.Option(1.0, "--epsilon", help="Initial exploration rate"),
     momentum: float = typer.Option(
         0.99, "--momentum", help="Momentum used for the EMA of average reward"
@@ -551,6 +536,21 @@ def train(
     num_layers: int = typer.Option(
         2, "--num-layers", "-l", help="Number of residual hidden layers"
     ),
+    model_type: str = typer.Option(
+        "mlp", "--model-type", "-t", help="Model architecture: 'mlp' or 'urm'"
+    ),
+    # URM-specific options
+    num_heads: int = typer.Option(
+        4, "--num-heads", help="Number of attention heads (URM only)"
+    ),
+    num_loops: int = typer.Option(
+        4, "--num-loops", help="Number of recurrent reasoning loops (URM only)"
+    ),
+    num_truncated_loops: int = typer.Option(
+        1,
+        "--truncated-loops",
+        help="Loops without gradients for memory savings (URM only)",
+    ),
     print_frequency: int = typer.Option(
         10, "--print-freq", "-p", help="Printing frequency"
     ),
@@ -560,34 +560,39 @@ def train(
         help="Show the last N steps of the best game (0 = disabled)",
     ),
     points_weight: float = typer.Option(
-        1.0, "--points", help="Weight for raw game points (0 = disabled)"
+        0.0, "--points", help="Weight for raw game points (0 = disabled)"
     ),
     smoothness_weight: float = typer.Option(
-        1.0, "--smoothness", help="Weight for smoothness reward shaping (0 = disabled)"
+        0.0, "--smoothness", help="Weight for smoothness reward shaping (0 = disabled)"
     ),
     max_tile_weight: float = typer.Option(
-        1.0, "--tile-bonus", help="Weight for max tile created bonus (0 = disabled)"
+        0.0, "--tile-bonus", help="Weight for max tile created bonus (0 = disabled)"
     ),
     corner_weight: float = typer.Option(
-        1.0, "--corner", help="Weight for corner bonus (max tile in corner)"
+        0.0, "--corner", help="Weight for corner bonus (max tile in corner)"
     ),
     adjacency_weight: float = typer.Option(
-        1.0,
+        0.0,
         "--adjacency",
         help="Weight for adjacency bonus (high-value tiles next to each other)",
     ),
     chain_weight: float = typer.Option(
-        1.0,
+        0.0,
         "--chain",
         help="Weight for monotonic chain bonus (descending sequence from max tile)",
     ),
+    monotonicity_weight: float = typer.Option(
+        0.0,
+        "--mono",
+        help="Weight for monotonicity score (consistent increase/decrease patterns)",
+    ),
     topological_weight: float = typer.Option(
-        1.0,
+        0.0,
         "--topo",
         help="Weight for topological score (proper neighbors, gap penalty, corner density)",
     ),
     win_bonus: float = typer.Option(
-        1000.0,
+        0.0,
         "--win-bonus",
         help="One-time bonus for creating the 2048 tile",
     ),
@@ -608,20 +613,44 @@ def train(
     model = None
     if model_path:
         typer.echo(f"Loading model from: {model_path}")
-        typer.echo("this path is not availaable")
+        typer.echo("this path is not available")
         import sys
 
         sys.exit(0)
     else:
-        typer.echo("Playing with random agent (no model specified)")
-        model = GameMLP(MLPConfig(hidden_dim=hidden_size, num_layers=num_layers))
+        # Create model based on model_type
+        model_type_lower = model_type.lower()
+        if model_type_lower == "mlp":
+            typer.echo(
+                f"Creating GameMLP model (hidden={hidden_size}, layers={num_layers})"
+            )
+            model = GameMLP(MLPConfig(hidden_dim=hidden_size, num_layers=num_layers))
+        elif model_type_lower == "urm":
+            typer.echo(
+                f"Creating GameURM model (hidden={hidden_size}, layers={num_layers}, "
+                f"heads={num_heads}, loops={num_loops}, truncated={num_truncated_loops})"
+            )
+            model = GameURM(
+                GameURMConfig(
+                    hidden_dim=hidden_size,
+                    num_layers=num_layers,
+                    num_heads=num_heads,
+                    num_loops=num_loops,
+                    num_truncated_loops=num_truncated_loops,
+                )
+            )
+        else:
+            typer.echo(f"Unknown model type: {model_type}. Use 'mlp' or 'urm'.")
+            import sys
+
+            sys.exit(1)
 
     model = model.to(device)
 
     # After creating the model, before training:
     with torch.no_grad():
-        model.proj_down.weight.zero_()
-        model.proj_down.bias.zero_()
+        model.action_head.weight.zero_()
+        model.action_head.bias.zero_()
 
     optimizer = AdamW(
         model.parameters(), lr=learning_rate, betas=(0.9, 0.99), weight_decay=0.01
@@ -632,10 +661,11 @@ def train(
         test_game = Game2048()
         test_game.reset()
         test_input = test_game.to_model_format().unsqueeze(0).to(device)
-        logits, _ = model(test_input)
-        probs = torch.softmax(logits, dim=1)
-        print(f"Initial logits: {logits}")
+        act_logits, val_logits = model(test_input)
+        probs = torch.softmax(act_logits, dim=1)
+        print(f"Initial logits: {act_logits}")
         print(f"Initial probs: {probs}")
+        print(f"Initial value: {val_logits}")
         print(f"Initial entropy: {-(probs * probs.log()).sum().item():.4f}")
 
     # train the model
@@ -648,19 +678,20 @@ def train(
 
         # game loop - parallel if workers > 1
         if workers > 1:
-            # Prepare args for worker processes (state dict, config, max_steps)
-            state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
-            config_dict = {
-                "hidden_dim": hidden_size,
-                "num_layers": num_layers,
-                "dropout": 0.0,  # dropout not used at inference
-            }
-            worker_args = [
-                (state_dict, config_dict, max_steps) for _ in range(batch_size)
-            ]
+            raise NotImplementedError("multithreading is not implemented")
+            # # Prepare args for worker processes (state dict, config, max_steps)
+            # state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
+            # config_dict = {
+            #     "hidden_dim": hidden_size,
+            #     "num_layers": num_layers,
+            #     "dropout": 0.0,  # dropout not used at inference
+            # }
+            # worker_args = [
+            #     (state_dict, config_dict, max_steps) for _ in range(batch_size)
+            # ]
 
-            with ProcessPoolExecutor(max_workers=workers) as executor:
-                rollout_episodes = list(executor.map(_worker_play_game, worker_args))
+            # with ProcessPoolExecutor(max_workers=workers) as executor:
+            #     rollout_episodes = list(executor.map(_worker_play_game, worker_args))
         else:
             for _ in range(batch_size):
                 rollout_episodes.append(
@@ -676,12 +707,15 @@ def train(
             corner_weight,
             adjacency_weight,
             chain_weight,
+            monotonicity_weight,
             topological_weight,
             win_bonus,
         )
 
         # Now we update the model's policy using this rollout
-        stats = model_optimize_step(model, rollout_episodes, optimizer, beta, device)
+        stats = model_optimize_step(
+            model, rollout_episodes, optimizer, beta, critic_strength, device
+        )
 
         # Get highest score from batch
         highest_score = max(
@@ -720,13 +754,20 @@ def train(
                 rollout_episodes
             )
             typer.echo(f"--- Step {train_step} ---")
+            typer.echo(f"  samples:        {n}")
             typer.echo(f"  loss:           {stats['loss']:.4f}")
+            typer.echo(f"  policy_loss:    {stats.get('policy_loss', 0):.4f}")
+            typer.echo(f"  entropy_loss:   {stats.get('entropy_loss', 0):.4f}")
+            typer.echo(f"  value_loss:     {stats.get('value_loss', 0):.4f}")
             typer.echo(f"  grad_norm:      {stats.get('grad_norm', 0):.4f}")
+            typer.echo(f"  entropy:        {stats.get('entropy', 0):.4f}")
             typer.echo(f"  peak_score:     {highest_score}")
             typer.echo(f"  avg_score:      {avg_score:.1f}")
             typer.echo(f"  reward_var:     {reward_var:.2f}")
             typer.echo(f"  future_var:     {future_var:.2f}")
+            adv_l2_norm = sum(a**2 for a in advantages) ** 0.5
             typer.echo(f"  advantage_var:  {adv_var:.2f}")
+            typer.echo(f"  advantage_l2:   {adv_l2_norm:.2f}")
             typer.echo(f"  reward_mean:    {reward_mean:.2f}")
             typer.echo(f"  zero_reward%:   {zero_reward_pct:.1f}%")
             typer.echo(
@@ -741,29 +782,26 @@ def train(
 
             # Calculate reward breakdown for best episode
             if best_episode["moves"]:
-                total_points = sum(
-                    m.get("points_earned", 0) for m in best_episode["moves"]
-                )
-                total_smoothness = sum(
-                    m.get("smoothness_delta", 0) for m in best_episode["moves"]
-                )
-                total_tile_bonus = sum(
-                    m.get("max_tile_created", 0) for m in best_episode["moves"]
-                )
-                total_corner = sum(
-                    m.get("corner_delta", 0) for m in best_episode["moves"]
-                )
-                total_adjacency = sum(
-                    m.get("adjacency_delta", 0) for m in best_episode["moves"]
-                )
-                total_chain = sum(
-                    m.get("chain_delta", 0) for m in best_episode["moves"]
-                )
-                total_topo = sum(
-                    m.get("topological_delta", 0) for m in best_episode["moves"]
-                )
+                moves = best_episode["moves"]
+                total_points = sum(m.get("points_earned", 0) for m in moves)
+                total_smoothness = sum(m.get("smoothness_delta", 0) for m in moves)
+                total_tile_bonus = sum(m.get("max_tile_created", 0) for m in moves)
+                total_corner = sum(m.get("corner_delta", 0) for m in moves)
+                total_adjacency = sum(m.get("adjacency_delta", 0) for m in moves)
+                total_chain = sum(m.get("chain_delta", 0) for m in moves)
+                total_topo = sum(m.get("topological_delta", 0) for m in moves)
 
-                # Build reward breakdown table
+                # PBRS monotonicity: telescopes to γ^T * Φ(s_T) - Φ(s_0)
+                mono_initial = moves[0]["monotonicity_before"]
+                mono_final = moves[-1]["monotonicity_after"]
+                mono_net_change = mono_final - mono_initial
+                num_steps = len(moves)
+                # the discount factor raised to the episode length
+                gamma_T = gamma**num_steps
+                # actual PBRS contribution to discounted return
+                mono_pbrs_contribution = gamma_T * mono_final - mono_initial
+
+                # Build reward breakdown table (absolute rewards only)
                 reward_components = [
                     ("points_earned", total_points, points_weight),
                     ("smoothness", total_smoothness, smoothness_weight),
@@ -790,6 +828,29 @@ def train(
                     f"    │ {'TOTAL':<15} │          │        │ {total_weighted:>8.1f} │"
                 )
                 typer.echo("    └─────────────────┴──────────┴────────┴──────────┘")
+
+                # PBRS monotonicity breakdown (shaped reward, telescopes over episode)
+                if monotonicity_weight != 0.0:
+                    typer.echo("")
+                    typer.echo(
+                        f"  PBRS Monotonicity (weight={monotonicity_weight:.2f}, γ={gamma:.4f}):"
+                    )
+                    typer.echo("    ┌───────────────────────┬──────────┐")
+                    typer.echo(f"    │ Φ(s₀) initial         │ {mono_initial:>8.1f} │")
+                    typer.echo(f"    │ Φ(s_T) final          │ {mono_final:>8.1f} │")
+                    typer.echo(
+                        f"    │ Net Δ (final - init)  │ {mono_net_change:>8.1f} │"
+                    )
+                    typer.echo("    ├───────────────────────┼──────────┤")
+                    typer.echo(f"    │ T (episode length)    │ {num_steps:>8d} │")
+                    typer.echo(f"    │ γ^T                   │ {gamma_T:>8.4f} │")
+                    typer.echo("    ├───────────────────────┼──────────┤")
+                    typer.echo(
+                        f"    │ γ^T·Φ(s_T) - Φ(s₀)    │ {mono_pbrs_contribution:>8.2f} │"
+                    )
+                    weighted_pbrs = mono_pbrs_contribution * monotonicity_weight
+                    typer.echo(f"    │ Weighted contribution │ {weighted_pbrs:>8.2f} │")
+                    typer.echo("    └───────────────────────┴──────────┘")
 
             # Show last N steps if requested
             if show_last_steps > 0 and best_episode["moves"]:
@@ -857,6 +918,8 @@ def train(
                             "adjacency": move.get("adjacency_delta", 0)
                             * adjacency_weight,
                             "chain": move.get("chain_delta", 0) * chain_weight,
+                            "monotonicity": move.get("monotonicity_delta", 0)
+                            * monotonicity_weight,
                             "topological": move.get("topological_delta", 0)
                             * topological_weight,
                         },
