@@ -146,7 +146,9 @@ def play_game_for_episode(
         # total_reward_corrected = total_reward / (1 - momentum ** (step + 1))
 
         # and then this determines which action was actually selected
-        step_data["predicted_future_value"] = predicted_future_value.detach().item()
+        step_data["predicted_future_value"] = (
+            predicted_future_value.detach().item()
+        )  # this one already comes normalized
         step_data["selected_direction"] = selected_action
         step_data["game_state"] = model_input.detach()
         step_data["state_before"] = state_before  # raw grid before move
@@ -274,7 +276,7 @@ def model_optimize_step(
 
     # value loss for the learned baseline
     value_logits = value_logits.view(-1)
-    value_loss_per_sample = F.huber_loss(value_logits, vtg_batch, reduction="none")
+    value_loss_per_sample = F.smooth_l1_loss(value_logits, vtg_batch, reduction="none")
     value_loss = critic_strength * value_loss_per_sample.mean()
 
     # combine all losses
@@ -309,6 +311,7 @@ def model_optimize_step(
 def calculate_advantage(
     episodes: list[dict],
     discount_rate: float,
+    rtg_first_moment: float,
     points_weight: float = 1.0,
     smoothness_weight: float = 1.0,
     max_tile_weight: float = 1.0,
@@ -318,7 +321,10 @@ def calculate_advantage(
     monotonicity_weight: float = 1.0,
     topological_weight: float = 1.0,
     win_bonus: float = 1000.0,
-):
+    rtg_beta=0.9,
+    rtg_m2=1.0,
+    rtg_mu=0.0,
+) -> tuple[list[dict], float, float, float]:
     """
     Calculate per-step advantage for policy gradient.
 
@@ -347,7 +353,10 @@ def calculate_advantage(
 
     # first we calculate the reward of each step
     for ep in episodes:
-        for move in ep["moves"]:
+        for i, move in enumerate(ep["moves"]):
+            # check if we're done or not
+            last_step = i + 1 == len(ep["moves"])
+
             # # combine merge points with board quality improvement
             points_reward = move["points_earned"] * points_weight
             # smoothness_reward = move.get("smoothness_delta", 0.0) * smoothness_weight
@@ -378,6 +387,7 @@ def calculate_advantage(
             # + win_reward
 
             # We have two types of rewards: absolute and shaped (PBRS)
+            points_reward = move["points_earned"] * points_weight
             absolute_reward = (
                 points_reward  # this is what each step gets no matter what
             )
@@ -385,9 +395,14 @@ def calculate_advantage(
             # Shaped reward, Potential-Based Reward Shaping (PBRS) - only use monotonicity for right now
             # allows us to provide relative rewawrds within each steps which get cancelled out once
             # the discounted reward is calculated.
+            mono_after = move["monotonicity_after"] if not last_step else 0.0
             shaped_reward = monotonicity_weight * (
-                discount_rate * move["monotonicity_after"] - move["monotonicity_before"]
+                discount_rate * mono_after - move["monotonicity_before"]
             )
+
+            # # zero this out on the final step
+            # if last_step:
+            #     shaped_reward = 0.0
             move["reward"] = absolute_reward + shaped_reward
 
     # next we calculate the discount rate and per-timestep baseline
@@ -399,6 +414,38 @@ def calculate_advantage(
             G = move["reward"] + discount_rate * G
             move["future_reward"] = G
 
+    # calculate the batch statistics for the return-to-go
+    N = sum(len(ep["moves"]) for ep in episodes)
+    rtg_batch_mean = sum(m["future_reward"] for ep in episodes for m in ep["moves"]) / N
+    rtg_batch_var = ((N - 1) ** -1) * sum(
+        (
+            (m["future_reward"] - rtg_batch_mean) ** 2
+            for ep in episodes
+            for m in ep["moves"]
+        )
+    )
+
+    # next, update the rtg moments
+    rtg_first_moment = rtg_beta * rtg_first_moment + (1 - rtg_beta) * rtg_batch_mean
+    eps = 1e-8
+    rtg_m2 = rtg_beta * rtg_m2 + (1 - rtg_beta) * (
+        rtg_batch_var + rtg_batch_mean**2
+    )  # this estimates E[G^2]
+    rtg_mu = rtg_beta * rtg_mu + (1 - rtg_beta) * rtg_batch_mean  # this estimates E[G]
+
+    # now get the variance
+    rtg_var = max(rtg_m2 - rtg_mu**2, eps)
+    rtg_stddev = rtg_var**0.5
+
+    # finally, we compute the normalized rtg
+    for ep in episodes:
+        for move in ep["moves"]:
+            # triangle swap
+            move["future_reward_raw"] = move["future_reward"]
+            move["future_reward"] = (move["future_reward"] - rtg_first_moment) / (
+                rtg_stddev + eps
+            )
+
     # calculate advantage using timestep-specific baselines (no normalization)
     for ep in episodes:
         for m in ep["moves"]:
@@ -408,6 +455,7 @@ def calculate_advantage(
                 not isinstance(v, torch.Tensor) for v in [m["future_reward"], baseline]
             ), "one of the variables in advantage computation is a tensor"
 
+            # computed in the normalized space
             m["advantage"] = m["future_reward"] - baseline
 
     # Here I tried to use the harmonic mean to get the advantage, but this still doesnt work
@@ -477,7 +525,8 @@ def calculate_advantage(
     # for episode in rollout_episodes:
     #     episode["advantage"] = episode["average_reward"] - med_r
 
-    return episodes
+    # we return the new moments
+    return episodes, rtg_first_moment, rtg_m2, rtg_mu
 
     # print summary statistics of the rollout episodes
     # total_points_list = [ep["total_points"] for ep in rollout_episodes]
@@ -602,6 +651,11 @@ def train(
         "--viz-dir",
         help="Directory to export visualization data (disabled if not set)",
     ),
+    rtg_beta: Optional[float] = typer.Option(
+        0.9,
+        "--rtg-beta",
+        help="This is the beta1 used when estimating the moments of the return-to-go",
+    ),
 ):
     """Watch the AI play 2048."""
     device = torch.device("cuda:0" if gpu and torch.cuda.is_available() else "cpu")
@@ -645,6 +699,11 @@ def train(
 
             sys.exit(1)
 
+    # initialize variables for tracking ema on RTG
+    rtg_mu = 0.0
+    rtg_m2 = 1.0
+    rtg_moment = 0.0
+
     model = model.to(device)
 
     # After creating the model, before training:
@@ -670,6 +729,23 @@ def train(
 
     # train the model
     highest_score = 0
+
+    # EMA trackers for running statistics (decay=0.001 ~ last 1000 steps)
+    ema_decay = 0.001
+    ema_avg_score = 0.0
+    ema_pct_512 = 0.0
+    ema_pct_1024 = 0.0
+    ema_pct_2048 = 0.0
+    ema_explained_var = 0.0
+
+    # helper to get max tile from episode
+    def get_max_tile(ep):
+        if "final_state" in ep:
+            return max(
+                2**cell if cell > 0 else 0 for row in ep["final_state"] for cell in row
+            )
+        return 0
+
     for train_step in tqdm(range(steps), desc=f"Running RL training"):
         model.eval()
 
@@ -698,9 +774,11 @@ def train(
                     play_game_for_episode(model, max_steps=max_steps, device=device)
                 )
 
-        rollout_episodes = calculate_advantage(
+        # get the updated moments after each batch
+        rollout_episodes, rtg_moment, rtg_m2, rtg_mu = calculate_advantage(
             rollout_episodes,
             gamma,
+            rtg_moment,
             points_weight,
             smoothness_weight,
             max_tile_weight,
@@ -710,6 +788,9 @@ def train(
             monotonicity_weight,
             topological_weight,
             win_bonus,
+            rtg_beta=rtg_beta,
+            rtg_m2=rtg_m2,
+            rtg_mu=rtg_mu,
         )
 
         # Now we update the model's policy using this rollout
@@ -728,31 +809,60 @@ def train(
             rollout_episodes
         )
 
+        # compute batch tile stats and update EMAs every step
+        max_tiles = [get_max_tile(ep) for ep in rollout_episodes]
+        num_eps = len(rollout_episodes)
+        batch_avg_score = sum(ep["total_points"] for ep in rollout_episodes) / num_eps
+        batch_pct_512 = sum(1 for t in max_tiles if t >= 512) / num_eps * 100
+        batch_pct_1024 = sum(1 for t in max_tiles if t >= 1024) / num_eps * 100
+        batch_pct_2048 = sum(1 for t in max_tiles if t >= 2048) / num_eps * 100
+
+        # update EMAs
+        ema_avg_score = (1 - ema_decay) * ema_avg_score + ema_decay * batch_avg_score
+        ema_pct_512 = (1 - ema_decay) * ema_pct_512 + ema_decay * batch_pct_512
+        ema_pct_1024 = (1 - ema_decay) * ema_pct_1024 + ema_decay * batch_pct_1024
+        ema_pct_2048 = (1 - ema_decay) * ema_pct_2048 + ema_decay * batch_pct_2048
+
         # Print stats instead of updating progress bar
         if train_step % print_frequency == 0:
             # collect per-step metrics
             all_moves = [m for ep in rollout_episodes for m in ep["moves"]]
             rewards = [m["reward"] for m in all_moves]
             advantages = [m["advantage"] for m in all_moves]
-            future_rewards = [m["future_reward"] for m in all_moves]
+            future_rewards_norm = [m["future_reward"] for m in all_moves]
+            future_rewards = [m["future_reward_raw"] for m in all_moves]
+            value_preds = [m["predicted_future_value"] for m in all_moves]
 
             # compute variances
             n = len(rewards)
             reward_mean = sum(rewards) / n
             reward_var = sum((r - reward_mean) ** 2 for r in rewards) / n
-
             adv_mean = sum(advantages) / n
             adv_var = sum((a - adv_mean) ** 2 for a in advantages) / n
 
             future_mean = sum(future_rewards) / n
             future_var = sum((f - future_mean) ** 2 for f in future_rewards) / n
 
+            future_norm_mean = sum(future_rewards_norm) / n
+            future_norm_var = (
+                sum((f - future_norm_mean) ** 2 for f in future_rewards_norm) / n
+            )
+
+            # value prediction stats
+            v_mean = sum(value_preds) / n
+            v_var = sum((v - v_mean) ** 2 for v in value_preds) / n
+
             # count zero rewards (sparse signal indicator)
             zero_reward_pct = sum(1 for r in rewards if r == 0) / n * 100
 
-            avg_score = sum([ep["total_points"] for ep in rollout_episodes]) / len(
-                rollout_episodes
+            scores = sorted([ep["total_points"] for ep in rollout_episodes])
+            avg_score = sum(scores) / len(scores)
+            median_score = (
+                scores[len(scores) // 2]
+                if len(scores) % 2 == 1
+                else (scores[len(scores) // 2 - 1] + scores[len(scores) // 2]) / 2
             )
+
             typer.echo(f"--- Step {train_step} ---")
             typer.echo(f"  samples:        {n}")
             typer.echo(f"  loss:           {stats['loss']:.4f}")
@@ -762,9 +872,20 @@ def train(
             typer.echo(f"  grad_norm:      {stats.get('grad_norm', 0):.4f}")
             typer.echo(f"  entropy:        {stats.get('entropy', 0):.4f}")
             typer.echo(f"  peak_score:     {highest_score}")
-            typer.echo(f"  avg_score:      {avg_score:.1f}")
+            typer.echo(f"  avg_score:      {avg_score:.1f} (ema: {ema_avg_score:.1f})")
+            typer.echo(f"  median_score:   {median_score:.1f}")
+            typer.echo(
+                f"  >=512:          {batch_pct_512:.1f}% (ema: {ema_pct_512:.1f}%)"
+            )
+            typer.echo(
+                f"  >=1024:         {batch_pct_1024:.1f}% (ema: {ema_pct_1024:.1f}%)"
+            )
+            typer.echo(
+                f"  >=2048:         {batch_pct_2048:.1f}% (ema: {ema_pct_2048:.1f}%)"
+            )
             typer.echo(f"  reward_var:     {reward_var:.2f}")
-            typer.echo(f"  future_var:     {future_var:.2f}")
+            typer.echo(f"  future_raw_var: {future_var:.2f}")
+            typer.echo(f"  future_var:     {future_norm_var:.2f}")
             adv_l2_norm = sum(a**2 for a in advantages) ** 0.5
             typer.echo(f"  advantage_var:  {adv_var:.2f}")
             typer.echo(f"  advantage_l2:   {adv_l2_norm:.2f}")
@@ -772,6 +893,39 @@ def train(
             typer.echo(f"  zero_reward%:   {zero_reward_pct:.1f}%")
             typer.echo(
                 f"  adv_range:      [{min(advantages):.2f}, {max(advantages):.2f}]"
+            )
+            future_norm_std = future_norm_var**0.5
+            adv_std = adv_var**0.5
+            typer.echo(f"  G_norm.mean:    {future_norm_mean:.4f}")
+            typer.echo(f"  G_norm.std:     {future_norm_std:.4f}")
+            typer.echo(
+                f"  G_norm.range:   [{min(future_rewards_norm):.2f}, {max(future_rewards_norm):.2f}]"
+            )
+
+            # critic usefulness: does V reduce variance of A compared to G?
+            # if std(A) < std(G), critic is learning a useful baseline
+            v_std = v_var**0.5
+            future_raw_std = future_var**0.5
+            variance_reduction = (
+                (future_norm_std - adv_std) / future_norm_std * 100
+                if future_norm_std > 0
+                else 0.0
+            )
+            # explained variance: EV = 1 - Var(G - V) / Var(G) = 1 - Var(A) / Var(G)
+            explained_var = (
+                1.0 - adv_var / future_norm_var if future_norm_var > 0 else 0.0
+            )
+            # update EMA for explained variance (only on print steps)
+            ema_explained_var = (
+                1 - ema_decay
+            ) * ema_explained_var + ema_decay * explained_var
+            typer.echo(f"  std(G_raw):     {future_raw_std:.4f}")
+            typer.echo(f"  std(G_norm):    {future_norm_std:.4f}")
+            typer.echo(f"  std(V):         {v_std:.4f}")
+            typer.echo(f"  std(A):         {adv_std:.4f}")
+            typer.echo(f"  var_reduction:  {variance_reduction:.1f}%")
+            typer.echo(
+                f"  explained_var:  {explained_var:.4f} (ema: {ema_explained_var:.4f})"
             )
 
             # Find and display the best game from this batch

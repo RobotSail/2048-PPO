@@ -609,7 +609,7 @@ class Game2048:
         return min(corners, key=lambda c: abs(c[0] - target[0]) + abs(c[1] - target[1]))
 
     @staticmethod
-    def monotonicity(grid: Grid, require_corner_max: bool = False) -> int:
+    def monotonicity(grid: Grid, require_corner_max: bool = True) -> int:
         """
         Calculate a game's monotonicity score by evaluating how well tiles
         are arranged in monotonically increasing/decreasing sequences.
@@ -665,7 +665,6 @@ class Game2048:
             ]
 
         if require_corner_max:
-            # check if max tile is in one of the four corners
             max_val = max(max(row) for row in grid)
             corners = [
                 (0, 0),
@@ -673,10 +672,37 @@ class Game2048:
                 (GRID_SIZE - 1, 0),
                 (GRID_SIZE - 1, GRID_SIZE - 1),
             ]
-            max_in_corner = any(grid[r][c] == max_val for r, c in corners)
+            edges = {0, GRID_SIZE - 1}
 
-            if not max_in_corner:
-                best = 0
+            # find max tile position
+            max_pos = None
+            for r in range(GRID_SIZE):
+                for c in range(GRID_SIZE):
+                    if grid[r][c] == max_val:
+                        max_pos = (r, c)
+                        break
+                if max_pos:
+                    break
+
+            if max_pos in corners:
+                pass  # full score
+            elif max_pos[0] in edges or max_pos[1] in edges:
+                best = best * 2 // 3  # on edge: 66% credit
+            else:
+                best = best // 4  # interior: 25% credit (harsh but not zero)
+        # if require_corner_max:
+        #     # check if max tile is in one of the four corners
+        #     max_val = max(max(row) for row in grid)
+        #     corners = [
+        #         (0, 0),
+        #         (0, GRID_SIZE - 1),
+        #         (GRID_SIZE - 1, 0),
+        #         (GRID_SIZE - 1, GRID_SIZE - 1),
+        #     ]
+        #     max_in_corner = any(grid[r][c] == max_val for r, c in corners)
+
+        #     if not max_in_corner:
+        #         best = 0
 
         return best
 
