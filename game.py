@@ -129,46 +129,38 @@ class Game2048:
         total_score = 0
         max_tile_created = 0
 
-        if direction == Direction.UP:
+        # Determine if we need to transpose and which merge function to use
+        if direction in (Direction.UP, Direction.DOWN):
+            # Transpose: work with columns as rows
             working_grid = [
                 [new_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)
             ]
-            results = [
-                Game2048._merge_and_shift_left_with_score(row) for row in working_grid
-            ]
+            merge_fn = (
+                Game2048._merge_and_shift_left_with_score
+                if direction == Direction.UP
+                else Game2048._merge_and_shift_right_with_score
+            )
+            results = [merge_fn(row) for row in working_grid]
             working_grid = [r[0] for r in results]
-            total_score = sum(r[1] for r in results)
-            max_tile_created = max(r[2] for r in results)
+            # Transpose back
             new_grid = [
                 [working_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)
             ]
-        elif direction == Direction.DOWN:
-            working_grid = [
-                [new_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)
-            ]
-            results = [
-                Game2048._merge_and_shift_right_with_score(row) for row in working_grid
-            ]
-            working_grid = [r[0] for r in results]
-            total_score = sum(r[1] for r in results)
-            max_tile_created = max(r[2] for r in results)
-            new_grid = [
-                [working_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)
-            ]
-        elif direction == Direction.LEFT:
-            results = [
-                Game2048._merge_and_shift_left_with_score(row) for row in new_grid
-            ]
+        else:  # LEFT or RIGHT
+            merge_fn = (
+                Game2048._merge_and_shift_left_with_score
+                if direction == Direction.LEFT
+                else Game2048._merge_and_shift_right_with_score
+            )
+            results = [merge_fn(row) for row in new_grid]
             new_grid = [r[0] for r in results]
-            total_score = sum(r[1] for r in results)
-            max_tile_created = max(r[2] for r in results)
-        elif direction == Direction.RIGHT:
-            results = [
-                Game2048._merge_and_shift_right_with_score(row) for row in new_grid
-            ]
-            new_grid = [r[0] for r in results]
-            total_score = sum(r[1] for r in results)
-            max_tile_created = max(r[2] for r in results)
+
+        # absolute scale (same points as what player earns)
+        total_score = sum(r[1] for r in results)
+
+        # log-scale
+        # total_score = sum(int(math.log2(r[1])) for r in results if r[1] > 0)
+        max_tile_created = max(r[2] for r in results)
 
         return new_grid, total_score, max_tile_created
 
@@ -609,7 +601,19 @@ class Game2048:
         return min(corners, key=lambda c: abs(c[0] - target[0]) + abs(c[1] - target[1]))
 
     @staticmethod
-    def monotonicity(grid: Grid, require_corner_max: bool = True) -> int:
+    def emptiness(grid: Grid) -> int:
+        """
+        Returns a count indicating the number of empty tiles on the baord.
+
+        Args:
+            grid: The game board state.
+
+        Returns number of empty tiles.
+        """
+        return sum(1 if grid[row][col] == 0 else 0 for row in range(GRID_SIZE) for col in range(GRID_SIZE))
+
+    @staticmethod
+    def monotonicity(grid: Grid, require_corner_max: bool = False) -> int:
         """
         Calculate a game's monotonicity score by evaluating how well tiles
         are arranged in monotonically increasing/decreasing sequences.
@@ -664,32 +668,57 @@ class Game2048:
                 for i in range(GRID_SIZE)
             ]
 
-        if require_corner_max:
-            max_val = max(max(row) for row in grid)
-            corners = [
-                (0, 0),
-                (0, GRID_SIZE - 1),
-                (GRID_SIZE - 1, 0),
-                (GRID_SIZE - 1, GRID_SIZE - 1),
-            ]
-            edges = {0, GRID_SIZE - 1}
+        # if require_corner_max:
+        max_val = max(max(row) for row in grid)
+        corners = [
+            (0, 0),
+            (0, GRID_SIZE - 1),
+            (GRID_SIZE - 1, 0),
+            (GRID_SIZE - 1, GRID_SIZE - 1),
+        ]
+        edges = {0, GRID_SIZE - 1}
 
-            # find max tile position
-            max_pos = None
-            for r in range(GRID_SIZE):
-                for c in range(GRID_SIZE):
-                    if grid[r][c] == max_val:
-                        max_pos = (r, c)
-                        break
-                if max_pos:
+        # find max tile position
+        max_pos = None
+        for r in range(GRID_SIZE):
+            for c in range(GRID_SIZE):
+                if grid[r][c] == max_val:
+                    max_pos = (r, c)
                     break
+            if max_pos:
+                break
 
-            if max_pos in corners:
-                pass  # full score
-            elif max_pos[0] in edges or max_pos[1] in edges:
-                best = best * 2 // 3  # on edge: 66% credit
-            else:
-                best = best // 4  # interior: 25% credit (harsh but not zero)
+        if max_pos in corners:
+            best *= 2 # corner bonus
+        else:
+            best = best // 2
+
+        # if require_corner_max:
+        #     max_val = max(max(row) for row in grid)
+        #     corners = [
+        #         (0, 0),
+        #         (0, GRID_SIZE - 1),
+        #         (GRID_SIZE - 1, 0),
+        #         (GRID_SIZE - 1, GRID_SIZE - 1),
+        #     ]
+        #     edges = {0, GRID_SIZE - 1}
+
+        #     # find max tile position
+        #     max_pos = None
+        #     for r in range(GRID_SIZE):
+        #         for c in range(GRID_SIZE):
+        #             if grid[r][c] == max_val:
+        #                 max_pos = (r, c)
+        #                 break
+        #         if max_pos:
+        #             break
+
+        #     if max_pos in corners:
+        #         pass  # full score
+        #     elif max_pos[0] in edges or max_pos[1] in edges:
+        #         best = best * 2 // 3  # on edge: 66% credit
+        #     else:
+        #         best = best // 4  # interior: 25% credit (harsh but not zero)
         # if require_corner_max:
         #     # check if max tile is in one of the four corners
         #     max_val = max(max(row) for row in grid)
@@ -881,6 +910,8 @@ class Game2048:
                     "monotonicity_before": 0.0,
                     "monotonicity_after": 0.0,
                     "topological_delta": 0.0,
+                    "emptiness_before": 0.0,
+                    "emptiness_after": 0.0,
                 },
             )
 
@@ -892,6 +923,7 @@ class Game2048:
         monotonicity_before = Game2048.monotonicity(self.grid)
         anchor_corner = Game2048._choose_anchor_corner(self.grid)
         topological_before = Game2048.topological_score(self.grid, anchor_corner)
+        emptiness_before = Game2048.emptiness(self.grid)
         max_exp_before = max(max(row) for row in self.grid)
 
         new_grid, points_earned, max_tile_created = Game2048.simulate_move(
@@ -905,6 +937,7 @@ class Game2048:
         adjacency_after = Game2048.adjacency_bonus(new_grid)
         chain_after = Game2048.monotonic_chain_score(new_grid)
         monotonicity_after = Game2048.monotonicity(new_grid)
+        emptiness_after = Game2048.emptiness(new_grid)
         topological_after = Game2048.topological_score(new_grid, anchor_corner)
         max_exp_after = max(max(row) for row in new_grid)
 
@@ -929,6 +962,8 @@ class Game2048:
                 # "monotonicity_delta": monotonicity_after - monotonicity_before,
                 "monotonicity_before": monotonicity_before,
                 "monotonicity_after": monotonicity_after,
+                "emptiness_before": emptiness_before,
+                "emptiness_after": emptiness_after,
                 "topological_delta": topological_after - topological_before,
                 "topological_anchor": anchor_corner,
             },
@@ -1004,6 +1039,22 @@ class GameMLP(nn.Module):
         """
         return [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT]
 
+    def get_param_groups(self, value_lr: float, other_lr: float) -> list[dict]:
+        """
+        Returns parameter groups with separate learning rates for value head vs everything else.
+        """
+        value_params = list(self.value_head.parameters())
+        other_params = []
+
+        for name, module in self.named_children():
+            if name != 'value_head':
+                other_params.extend(module.parameters())
+
+        return [
+            {'params': other_params, 'lr': other_lr},
+            {'params': value_params, 'lr': value_lr},
+        ]
+    
     def forward(
         self,
         inputs: torch.Tensor,

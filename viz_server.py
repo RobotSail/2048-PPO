@@ -65,6 +65,23 @@ def get_data(filename):
         abort(500, f"Error reading file: {e}")
 
 
+@app.route("/api/clear", methods=["POST"])
+def clear_history():
+    """Delete all visualization data files."""
+    if not VIZ_DATA_DIR.exists():
+        return jsonify({"deleted": 0})
+    
+    deleted_count = 0
+    for f in VIZ_DATA_DIR.glob("*.json"):
+        try:
+            f.unlink()
+            deleted_count += 1
+        except OSError:
+            continue
+    
+    return jsonify({"deleted": deleted_count})
+
+
 def main():
     parser = argparse.ArgumentParser(description="2048 Training Visualization Server")
     parser.add_argument(

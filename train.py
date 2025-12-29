@@ -3,22 +3,27 @@ CLI training interface for 2048 AI agent.
 Run with: python train.py [command]
 """
 
-import typer
-from typing import Optional
-from pathlib import Path
+import json
 import random
 import time
-import json
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+from tqdm import tqdm
+
+from transformers import get_scheduler
 import multiprocessing
 import torch
-from torch.optim import AdamW
+import typer
 from torch.nn import functional as F
+from torch.optim import AdamW 
 from tqdm import tqdm
 
 
 from game import Game2048, Direction, GameMLP, MLPConfig, GameURM, GameURMConfig
+from logger import MetricLogger
 
 app = typer.Typer(help="Train and evaluate 2048 AI agents")
 
@@ -130,21 +135,6 @@ def play_game_for_episode(
         move_count += 1
         total_points += points_earned
 
-        # # calculate the per-step reward
-        # if highest_points != 0:
-        #     step_reward = (
-        #         1.0 if points_earned == highest_points else points_earned / highest_points
-        #     )
-        # else:
-        #     # since no good move was possible, we just give this one
-        #     # as a freebie to the model so overall reward doesn't penalize
-        #     # exploration as a means of rebalancing the board
-        #     step_reward = 1.0
-
-        # update the running avg and collect the bias-corrected format
-        # total_reward = total_reward * momentum + step_reward * (1 - momentum)
-        # total_reward_corrected = total_reward / (1 - momentum ** (step + 1))
-
         # and then this determines which action was actually selected
         step_data["predicted_future_value"] = (
             predicted_future_value.detach().item()
@@ -165,8 +155,11 @@ def play_game_for_episode(
         step_data["adjacency_delta"] = info.get("adjacency_delta", 0.0)
         step_data["chain_delta"] = info.get("chain_delta", 0.0)
         # step_data["monotonicity_delta"] = info.get("monotonicity_delta", 0.0)
-        step_data["monotonicity_after"] = info.get("monotonicity_after", 0.0)
-        step_data["monotonicity_before"] = info.get("monotonicity_before", 0.0)
+        monotonicity_next = info["monotonicity_after"] if not done else 0.0
+        step_data["monotonicity_after"] = monotonicity_next
+        step_data["monotonicity_before"] = info["monotonicity_before"]
+        step_data["emptiness_before"] = info["emptiness_before"]
+        step_data["emptiness_after"] = info["emptiness_after"] if not done else 0.0
         step_data["topological_delta"] = info.get("topological_delta", 0.0)
         step_data["topological_anchor"] = info.get("topological_anchor")
         step_data["entropy"] = step_entropy
@@ -209,6 +202,7 @@ def model_optimize_step(
     model: torch.nn.Module,
     episodes: list[dict],
     optimizer: torch.optim.Optimizer,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
     beta: float = 0.1,
     critic_strength: float = 1.0,
     device: torch.device = None,
@@ -223,14 +217,12 @@ def model_optimize_step(
     minibatch = []
     for ep in episodes:
         for move in ep["moves"]:
-            input_state = move["game_state"]
             direction_idx = torch.tensor([move["selected_direction"]])
-            action_mask = move["action_mask"]
             minibatch.append(
                 (
-                    input_state,
+                    move["game_state"],
                     direction_idx,
-                    action_mask,
+                    move["action_mask"],
                     move["advantage"],
                     move["future_reward"],
                 )
@@ -241,7 +233,7 @@ def model_optimize_step(
     target_batch = torch.stack([item[1] for item in minibatch])
     action_mask = torch.tensor([item[2] for item in minibatch])
     advantage = torch.tensor([item[3] for item in minibatch], dtype=torch.float32)
-    vtg_batch = torch.tensor([item[4] for item in minibatch])
+    rtg_batch = torch.tensor([item[4] for item in minibatch])
 
     if device is not None:
         input_batch = input_batch.to(device)
@@ -260,23 +252,26 @@ def model_optimize_step(
 
     # convert (B, T) into (B x T)
     targets = targets.view(-1)
-    action_logits[action_mask] = -torch.inf  # mask to kill the training signal
+    masked_action_logits = torch.masked_fill(action_logits, action_mask, float('-inf'))
 
     # compute the advantaged cross-entropy loss
     policy_loss_per_sample = F.cross_entropy(
-        input=action_logits, target=targets, reduction="none"
+        input=masked_action_logits, target=targets, reduction="none"
     )
     policy_loss_per_sample *= advantage
     policy_loss = policy_loss_per_sample.mean()
 
+    # from IPython import embed
+    # embed()
+
     # entropy regularization
-    masked_probs = torch.softmax(action_logits, dim=1)
-    entropy_per_sample = -(masked_probs * (masked_probs + 1e-8).log()).sum(dim=1)
+    masked_probs = torch.masked.softmax(action_logits, dim=1, mask=~action_mask)
+    entropy_per_sample = -torch.masked.sum(masked_probs * (masked_probs + 1e-8).log(), dim=1, mask=~action_mask)
     entropy_loss = -beta * entropy_per_sample.mean()
 
     # value loss for the learned baseline
     value_logits = value_logits.view(-1)
-    value_loss_per_sample = F.smooth_l1_loss(value_logits, vtg_batch, reduction="none")
+    value_loss_per_sample = F.smooth_l1_loss(value_logits, rtg_batch, reduction="none")
     value_loss = critic_strength * value_loss_per_sample.mean()
 
     # combine all losses
@@ -289,6 +284,33 @@ def model_optimize_step(
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     optimizer.zero_grad()
+    current_lr = lr_scheduler.get_last_lr()[0] if lr_scheduler is not None else 0.0
+    if lr_scheduler is not None:
+        lr_scheduler.step()
+    
+    # here we compute KL(old||new)
+    with torch.no_grad():
+        # new policy
+        new_action_logits, new_value_logits = model(
+            inputs=input_batch
+        )
+        new_action_logits: torch.Tensor = new_action_logits
+        new_action_logits = torch.masked_fill(new_action_logits, action_mask, float('-inf'))
+
+        # we must compute softmax across the new logits but only
+        # where the moves are valid
+
+        # calculate the probs
+        # new_action_probs = torch.softmax(new_action_logits, dim=1)
+
+        # next we calculate P(old)/P(new)
+        old_probs = torch.masked.softmax(action_logits, mask=~action_mask, dim=1) 
+        new_probs = torch.masked.softmax(new_action_logits, dim=1, mask=~action_mask)
+
+        per_sample_kl = torch.masked.sum(old_probs * (old_probs / new_probs).log(), dim=1, mask=~action_mask)
+        
+
+
 
     # collect stats for logging
     stats = {
@@ -298,14 +320,18 @@ def model_optimize_step(
         "value_loss": value_loss.detach().cpu().item(),
         "grad_norm": grad_norm,
         "entropy": entropy_per_sample.mean().detach().cpu().item(),
+        "kl_total": per_sample_kl.sum().detach().cpu().item(),
+        "kl_average": per_sample_kl.mean().detach().cpu().item(),
+        "kl_max": per_sample_kl.max().detach().cpu().item(),
+        "lr": current_lr,
     }
     return stats
 
     # # print optimizer step stats
-    # typer.echo("\nOptimizer step completed:")
-    # typer.echo(f"  Total loss: {total_loss.item():.4f}")
-    # typer.echo(f"  Gradient norm: {grad_norm.item():.4f}")
-    # typer.echo(f"  Number of batches: {len(batches)}")
+    # logger.print("\nOptimizer step completed:")
+    # logger.print(f"  Total loss: {total_loss.item():.4f}")
+    # logger.print(f"  Gradient norm: {grad_norm.item():.4f}")
+    # logger.print(f"  Number of batches: {len(batches)}")
 
 
 def calculate_advantage(
@@ -319,11 +345,13 @@ def calculate_advantage(
     adjacency_weight: float = 1.0,
     chain_weight: float = 1.0,
     monotonicity_weight: float = 1.0,
+    emptiness_weight: float = 1.0,
     topological_weight: float = 1.0,
     win_bonus: float = 1000.0,
     rtg_beta=0.9,
     rtg_m2=1.0,
     rtg_mu=0.0,
+    rtg_step=1,
 ) -> tuple[list[dict], float, float, float]:
     """
     Calculate per-step advantage for policy gradient.
@@ -348,43 +376,14 @@ def calculate_advantage(
     - topological_delta rewards proper tile organization (neighbors, gaps, density)
     - win_bonus is a one-time reward for creating the 2048 tile (exponent 11)
     """
+    
+
     # 2048 = 2^11, so exponent is 11
     WIN_TILE_EXPONENT = 11
 
     # first we calculate the reward of each step
     for ep in episodes:
         for i, move in enumerate(ep["moves"]):
-            # check if we're done or not
-            last_step = i + 1 == len(ep["moves"])
-
-            # # combine merge points with board quality improvement
-            points_reward = move["points_earned"] * points_weight
-            # smoothness_reward = move.get("smoothness_delta", 0.0) * smoothness_weight
-            # tile_bonus = move.get("max_tile_created", 0) * max_tile_weight
-            # corner_bonus = move.get("corner_delta", 0.0) * corner_weight
-            # adjacency_bonus = move.get("adjacency_delta", 0.0) * adjacency_weight
-            # chain_bonus = move.get("chain_delta", 0.0) * chain_weight
-            # topological_bonus = move.get("topological_delta", 0.0) * topological_weight
-
-            # One-time bonus for creating the 2048 tile (detect first crossing)
-            # max_before = move.get("max_exponent_before", 0)
-            # max_after = move.get("max_exponent_after", max_before)
-            # created_2048 = (
-            #     max_before < WIN_TILE_EXPONENT and max_after >= WIN_TILE_EXPONENT
-            # )
-            # # win_reward = win_bonus if created_2048 else 0.0
-
-            # Legacy method of pointing, do not use
-            # move["reward"] = points_reward
-            #  All of the below points should strictly be **shaped reward**, and not absolute
-            # + smoothness_reward
-            # + tile_bonus
-            # + corner_bonus
-            # + adjacency_bonus
-            # + chain_bonus
-            # + monotonicity_bonus
-            # + topological_bonus
-            # + win_reward
 
             # We have two types of rewards: absolute and shaped (PBRS)
             points_reward = move["points_earned"] * points_weight
@@ -395,10 +394,12 @@ def calculate_advantage(
             # Shaped reward, Potential-Based Reward Shaping (PBRS) - only use monotonicity for right now
             # allows us to provide relative rewawrds within each steps which get cancelled out once
             # the discounted reward is calculated.
-            mono_after = move["monotonicity_after"] if not last_step else 0.0
-            shaped_reward = monotonicity_weight * (
-                discount_rate * mono_after - move["monotonicity_before"]
-            )
+            # mono_after = move["monotonicity_after"] if not last_step else 0.0
+            shaped_reward = sum([
+                monotonicity_weight * (discount_rate * move["monotonicity_after"]  - move["monotonicity_before"]),
+                emptiness_weight * (discount_rate * move["emptiness_after"] - move["emptiness_before"])
+            ])
+            
 
             # # zero this out on the final step
             # if last_step:
@@ -412,41 +413,52 @@ def calculate_advantage(
         for t in reversed(range(len(moves))):
             move = moves[t]
             G = move["reward"] + discount_rate * G
-            move["future_reward"] = G
+            move["future_reward_raw"] = G
 
-    # calculate the batch statistics for the return-to-go
-    N = sum(len(ep["moves"]) for ep in episodes)
-    rtg_batch_mean = sum(m["future_reward"] for ep in episodes for m in ep["moves"]) / N
-    rtg_batch_var = ((N - 1) ** -1) * sum(
-        (
-            (m["future_reward"] - rtg_batch_mean) ** 2
-            for ep in episodes
-            for m in ep["moves"]
-        )
-    )
 
-    # next, update the rtg moments
-    rtg_first_moment = rtg_beta * rtg_first_moment + (1 - rtg_beta) * rtg_batch_mean
+    # next, calculate statistics of the current batch so we can have them after we normalize
     eps = 1e-8
-    rtg_m2 = rtg_beta * rtg_m2 + (1 - rtg_beta) * (
-        rtg_batch_var + rtg_batch_mean**2
-    )  # this estimates E[G^2]
-    rtg_mu = rtg_beta * rtg_mu + (1 - rtg_beta) * rtg_batch_mean  # this estimates E[G]
+    future_rewards_raw = [m["future_reward_raw"] for ep in episodes for m in ep["moves"]]
+    N = len(future_rewards_raw)
+    if N == 0:
+        return episodes, rtg_first_moment, rtg_m2, rtg_mu
 
-    # now get the variance
-    rtg_var = max(rtg_m2 - rtg_mu**2, eps)
+    # first, calculate the batch statistics for the return-to-go
+    rtg_batch_mean = sum(future_rewards_raw) / N
+    rtg_batch_var = (
+        0.0
+        if N <= 1
+        else sum((fr - rtg_batch_mean) ** 2 for fr in future_rewards_raw) / N
+    )
+    
+    # rtg_updated_first_moment = rtg_beta * rtg_first_moment + (1 - rtg_beta) * rtg_batch_mean
+    # rtg_updated_m2 = rtg_beta * rtg_m2 + (1 - rtg_beta) * (
+    #     rtg_batch_var + rtg_batch_mean**2
+    # )  # this estimates E[G^2]
+    # rtg_updated_mu = rtg_beta * rtg_mu + (1 - rtg_beta) * rtg_batch_mean  # this estimates E[G]
+    
+
+    # calculate bias-corrected moments
+    bias_correction = max(1 - rtg_beta ** max(rtg_step, 1), eps)
+
+    # first moment for advantage normalization - centers the advantage distribution
+    rtg_mu_corrected = rtg_mu / bias_correction
+
+    # now get the variance - normalizes the advantage spread
+    rtg_m2_corrected = rtg_m2 / bias_correction
+    rtg_var = max(rtg_m2_corrected - rtg_mu_corrected**2, eps)
     rtg_stddev = rtg_var**0.5
+
 
     # finally, we compute the normalized rtg
     for ep in episodes:
         for move in ep["moves"]:
             # triangle swap
-            move["future_reward_raw"] = move["future_reward"]
-            move["future_reward"] = (move["future_reward"] - rtg_first_moment) / (
+            move["future_reward"] = (move["future_reward_raw"] - rtg_mu_corrected) / (
                 rtg_stddev + eps
             )
 
-    # calculate advantage using timestep-specific baselines (no normalization)
+    # calculate advantage using timestep-specific baselines in the normalized space
     for ep in episodes:
         for m in ep["moves"]:
             baseline = m["predicted_future_value"]
@@ -458,96 +470,318 @@ def calculate_advantage(
             # computed in the normalized space
             m["advantage"] = m["future_reward"] - baseline
 
-    # Here I tried to use the harmonic mean to get the advantage, but this still doesnt work
-    # calculate the reward for each model
-    # for episode in episodes:
-    #     # harmonic mean
-    #     episode["reward"] = len(episode["moves"]) / sum(
-    #         1 / m["reward"] * max(1.0, m["highest_points"]) if m["reward"] > 0 else 0
-    #         for m in episode["moves"]
-    #     )
-
-    # # calculate advantage
-    # # avg_reward = len(rollout_episodes) / sum(
-    # #     1 / e["reward"] if e["reward"] > 0 else 0 for e in rollout_episodes
-    # # )
-    # N = len(episodes)
-    # avg_reward = sum(e["reward"] for e in episodes) / N
+    # # stabilize policy updates: center and scale advantages within the batch
+    # advantages = [m["advantage"] for ep in episodes for m in ep["moves"]]
+    # adv_mean = sum(advantages) / len(advantages)
+    # adv_var = sum((a - adv_mean) ** 2 for a in advantages) / len(advantages)
+    # adv_std = adv_var**0.5
     # for ep in episodes:
-    #     ep["advantage_unnormalized"] = ep["reward"] - avg_reward
+    #     for m in ep["moves"]:
+            # m["advantage"] = (m["advantage"] - adv_mean) / (adv_std + eps)
 
-    # # next, we calculate the normalized advantage
-    # advantage_avg = sum(ep["advantage_unnormalized"] for ep in episodes) / N
-    # advantage_stddev = (
-    #     (1 / (N - 1))
-    #     * sum((e["advantage_unnormalized"] - advantage_avg) ** 2 for e in episodes)
-    # ) ** 0.5
+    # finally, we compute updated rtg moments using the batch statistics
+    # We wait until the end to do this so that the loss between the current value head and
+    # the advantage is based on the same distribution
+    
+    # next, calculate new moments using current batch statistics
+    # (we do this AFTER normalizing the batch to prevent noise from entering value head)
+    rtg_updated_first_moment = rtg_beta * rtg_first_moment + (1 - rtg_beta) * rtg_batch_mean
+    rtg_updated_m2 = rtg_beta * rtg_m2 + (1 - rtg_beta) * (
+        rtg_batch_var + rtg_batch_mean**2
+    )  # this estimates E[G^2]
+    rtg_updated_mu = rtg_beta * rtg_mu + (1 - rtg_beta) * rtg_batch_mean  # this estimates E[G]
+    rtg_updated_first_moment = rtg_updated_mu  # keep both mean trackers aligned
 
-    # # add an epsilon for numerical stability
-    # eps = 1e-8
-    # for ep in episodes:
-    #     ep["advantage"] = (ep["advantage_unnormalized"] - advantage_avg) / (
-    #         advantage_stddev + eps
-    #     )
-
-    # so then we rescale everything to fit this
-
-    # for episode in rollout_episodes:
-    #     episode["advantage"] = episode["reward"] - avg_reward
-
-    # Print advantage statistics
-    # Advantage statistics will be printed in the training loop
-
-    # now that we have our rollout episodes, we need to evaluate the quality of each rollout
-    # personally, my thinking is we should use the median reward as the baseline where advantage=0
-    # and then when we calculate cross-entropy, we push rollouts towards the positive reward
-    # rollout_episodes = sorted(rollout_episodes, key=lambda x: x["average_reward"])
-
-    # # now we need to calculate the advantage of each  sample
-    # min_r, max_r = (
-    #     rollout_episodes[0]["average_reward"],
-    #     rollout_episodes[-1]["average_reward"],
-    # )
-    # # print(f"{min_r=:.3f}, {max_r=:.3f}")
-
-    # # calculate median
-    # if len(rollout_episodes) % 2 != 0:
-    #     middle_idx = len(rollout_episodes) // 2
-    #     med_r = rollout_episodes[middle_idx]["average_reward"]
-    # else:
-    #     middle_idx = len(rollout_episodes) // 2
-    #     med_r = (
-    #         rollout_episodes[middle_idx]["average_reward"]
-    #         + rollout_episodes[middle_idx - 1]["average_reward"]
-    #     ) / 2
-
-    # calculate advantage
-    # for episode in rollout_episodes:
-    #     episode["advantage"] = episode["average_reward"] - med_r
 
     # we return the new moments
-    return episodes, rtg_first_moment, rtg_m2, rtg_mu
+    return episodes, rtg_updated_first_moment, rtg_updated_m2, rtg_updated_mu
 
-    # print summary statistics of the rollout episodes
-    # total_points_list = [ep["total_points"] for ep in rollout_episodes]
-    # total_steps_list = [ep["total_steps"] for ep in rollout_episodes]
-    # average_rewards = [ep["average_reward"] for ep in rollout_episodes]
-    # print(f"\n{'=' * 50}")
-    # print(f"Rollout Summary Statistics:")
-    # print(f"{'=' * 50}")
-    # print(
-    #     f"Total Points - Min: {min(total_points_list)}, Max: {max(total_points_list)}, Median: {total_points_list[len(total_points_list) // 2]}"
-    # )
-    # print(
-    #     f"Total Steps  - Min: {min(total_steps_list)}, Max: {max(total_steps_list)}, Median: {total_steps_list[len(total_steps_list) // 2]}"
-    # )
-    # print(
-    #     f"Avg Reward   - Min: {min(average_rewards):.3f}, Max: {max(average_rewards):.3f}, Median: {average_rewards[len(average_rewards) // 2]:.3f}"
-    # )
-    # # Calculate advantage for each episode
-    # for episode in rollout_episodes:
-    #     print(f"Episode advantage: {episode['advantage']:.3f}")
-    # print(f"{'=' * 50}\n")
+
+@dataclass
+class RewardWeights:
+    """Container for reward component weights."""
+    points: float = 0.0
+    smoothness: float = 0.0
+    max_tile: float = 0.0
+    corner: float = 0.0
+    adjacency: float = 0.0
+    chain: float = 0.0
+    monotonicity: float = 0.0
+    emptiness: float = 0.0
+    topological: float = 0.0
+
+
+def compute_batch_stats(
+    rollout_episodes: list[dict],
+    optimizer_stats: dict,
+    highest_score: int,
+    ema_avg_score: float,
+    ema_pct_512: float,
+    ema_pct_1024: float,
+    ema_pct_2048: float,
+    batch_pct_512: float,
+    batch_pct_1024: float,
+    batch_pct_2048: float,
+    ema_decay: float,
+    ema_explained_var: float,
+) -> tuple[dict, float]:
+    """
+    Compute all batch statistics for logging.
+    Returns (metrics_dict, updated_ema_explained_var).
+    """
+    all_moves = [m for ep in rollout_episodes for m in ep["moves"]]
+    rewards = [m["reward"] for m in all_moves]
+    advantages = [m["advantage"] for m in all_moves]
+    future_rewards_norm = [m["future_reward"] for m in all_moves]
+    future_rewards = [m["future_reward_raw"] for m in all_moves]
+    value_preds = [m["predicted_future_value"] for m in all_moves]
+
+    n = len(rewards)
+    reward_mean = sum(rewards) / n
+    reward_var = sum((r - reward_mean) ** 2 for r in rewards) / n
+    adv_mean = sum(advantages) / n
+    adv_var = sum((a - adv_mean) ** 2 for a in advantages) / n
+
+    future_mean = sum(future_rewards) / n
+    future_var = sum((f - future_mean) ** 2 for f in future_rewards) / n
+
+    future_norm_mean = sum(future_rewards_norm) / n
+    future_norm_var = sum((f - future_norm_mean) ** 2 for f in future_rewards_norm) / n
+
+    v_mean = sum(value_preds) / n
+    v_var = sum((v - v_mean) ** 2 for v in value_preds) / n
+
+    zero_reward_pct = sum(1 for r in rewards if r == 0) / n * 100
+
+    scores = sorted([ep["total_points"] for ep in rollout_episodes])
+    avg_score = sum(scores) / len(scores)
+    median_score = (
+        scores[len(scores) // 2]
+        if len(scores) % 2 == 1
+        else (scores[len(scores) // 2 - 1] + scores[len(scores) // 2]) / 2
+    )
+
+    adv_l2_norm = sum(a**2 for a in advantages) ** 0.5
+    future_norm_std = future_norm_var**0.5
+    adv_std = adv_var**0.5
+    v_std = v_var**0.5
+    future_raw_std = future_var**0.5
+    variance_reduction = (
+        (future_norm_std - adv_std) / future_norm_std * 100 if future_norm_std > 0 else 0.0
+    )
+    explained_var = 1.0 - adv_var / future_norm_var if future_norm_var > 0 else 0.0
+    updated_ema_explained_var = (1 - ema_decay) * ema_explained_var + ema_decay * explained_var
+
+    metrics = {
+        "samples": n,
+        "loss": optimizer_stats["loss"],
+        "policy_loss": optimizer_stats.get("policy_loss", 0),
+        "entropy_loss": optimizer_stats.get("entropy_loss", 0),
+        "value_loss": optimizer_stats.get("value_loss", 0),
+        "grad_norm": float(optimizer_stats.get("grad_norm", 0)),
+        "entropy": optimizer_stats.get("entropy", 0),
+        "peak_score": highest_score,
+        "avg_score": avg_score,
+        "ema_avg_score": ema_avg_score,
+        "median_score": median_score,
+        "pct_512": batch_pct_512,
+        "ema_pct_512": ema_pct_512,
+        "pct_1024": batch_pct_1024,
+        "ema_pct_1024": ema_pct_1024,
+        "pct_2048": batch_pct_2048,
+        "ema_pct_2048": ema_pct_2048,
+        "reward_var": reward_var,
+        "reward_mean": reward_mean,
+        "zero_reward_pct": zero_reward_pct,
+        "advantage_var": adv_var,
+        "advantage_l2": adv_l2_norm,
+        "adv_min": min(advantages),
+        "adv_max": max(advantages),
+        "G_norm_mean": future_norm_mean,
+        "G_norm_std": future_norm_std,
+        "G_norm_min": min(future_rewards_norm),
+        "G_norm_max": max(future_rewards_norm),
+        "G_raw_std": future_raw_std,
+        "V_std": v_std,
+        "A_std": adv_std,
+        "var_reduction": variance_reduction,
+        "explained_var": explained_var,
+        "ema_explained_var": updated_ema_explained_var,
+        "kl_total": optimizer_stats.get("kl_total", 0),
+        "kl_average": optimizer_stats.get("kl_average", 0),
+        "kl_max": optimizer_stats.get("kl_max", 0),
+        "learning_rate": optimizer_stats.get("lr", 0),
+    }
+    return metrics, updated_ema_explained_var
+
+
+def print_episode_breakdown(
+    logger,
+    episode: dict,
+    weights: RewardWeights,
+    gamma: float,
+) -> None:
+    """Print reward breakdown tables for an episode."""
+    if not episode.get("moves"):
+        return
+
+    logger.print(
+        f"\n  Best game this batch (score: {episode['total_points']}, steps: {episode['total_steps']}):"
+    )
+
+    moves = episode["moves"]
+    total_points = sum(m.get("points_earned", 0) for m in moves)
+    total_smoothness = sum(m.get("smoothness_delta", 0) for m in moves)
+    total_tile_bonus = sum(m.get("max_tile_created", 0) for m in moves)
+    total_corner = sum(m.get("corner_delta", 0) for m in moves)
+    total_adjacency = sum(m.get("adjacency_delta", 0) for m in moves)
+    total_chain = sum(m.get("chain_delta", 0) for m in moves)
+    total_topo = sum(m.get("topological_delta", 0) for m in moves)
+
+    num_steps = len(moves)
+    gamma_T = gamma**num_steps
+
+    # PBRS potentials: monotonicity
+    mono_initial = moves[0]["monotonicity_before"]
+    mono_final = moves[-1]["monotonicity_after"]
+    mono_pbrs_contribution = gamma_T * mono_final - mono_initial
+
+    # PBRS potentials: emptiness
+    empty_initial = moves[0].get("emptiness_before", 0.0)
+    empty_final = moves[-1].get("emptiness_after", 0.0)
+    empty_pbrs_contribution = gamma_T * empty_final - empty_initial
+
+    reward_components = [
+        ("points_earned", total_points, weights.points),
+        ("smoothness", total_smoothness, weights.smoothness),
+        ("tile_bonus", total_tile_bonus, weights.max_tile),
+        ("corner", total_corner, weights.corner),
+        ("adjacency", total_adjacency, weights.adjacency),
+        ("chain", total_chain, weights.chain),
+        ("topological", total_topo, weights.topological),
+    ]
+
+    logger.print("  Reward breakdown:")
+    logger.print("    ┌─────────────────┬──────────┬────────┬──────────┐")
+    logger.print("    │ Component       │      Raw │ Weight │ Weighted │")
+    logger.print("    ├─────────────────┼──────────┼────────┼──────────┤")
+    total_weighted = 0.0
+    for name, raw, weight in reward_components:
+        weighted = raw * weight
+        total_weighted += weighted
+        logger.print(f"    │ {name:<15} │ {raw:>8.1f} │ {weight:>6.2f} │ {weighted:>8.1f} │")
+    logger.print("    ├─────────────────┼──────────┼────────┼──────────┤")
+    logger.print(f"    │ {'TOTAL':<15} │          │        │ {total_weighted:>8.1f} │")
+    logger.print("    └─────────────────┴──────────┴────────┴──────────┘")
+
+    # print PBRS table if any shaped rewards are enabled
+    if weights.monotonicity != 0.0 or weights.emptiness != 0.0:
+        logger.print("")
+        logger.print(f"  PBRS Reward Shaping (γ={gamma:.4f}, T={num_steps}, γ^T={gamma_T:.4f}):")
+        logger.print("    ┌─────────────┬──────────┬──────────┬────────┬──────────┐")
+        logger.print("    │ Potential   │    Φ(s₀) │   Φ(s_T) │ Weight │ γ^T·Φ_T-Φ₀│")
+        logger.print("    ├─────────────┼──────────┼──────────┼────────┼──────────┤")
+
+        total_pbrs = 0.0
+        if weights.monotonicity != 0.0:
+            weighted_mono = mono_pbrs_contribution * weights.monotonicity
+            total_pbrs += weighted_mono
+            logger.print(
+                f"    │ monotonicity│ {mono_initial:>8.1f} │ {mono_final:>8.1f} │ {weights.monotonicity:>6.2f} │ {weighted_mono:>9.2f} │"
+            )
+        if weights.emptiness != 0.0:
+            weighted_empty = empty_pbrs_contribution * weights.emptiness
+            total_pbrs += weighted_empty
+            logger.print(
+                f"    │ emptiness   │ {empty_initial:>8.1f} │ {empty_final:>8.1f} │ {weights.emptiness:>6.2f} │ {weighted_empty:>9.2f} │"
+            )
+
+        logger.print("    ├─────────────┼──────────┼──────────┼────────┼──────────┤")
+        logger.print(f"    │ TOTAL       │          │          │        │ {total_pbrs:>9.2f} │")
+        logger.print("    └─────────────┴──────────┴──────────┴────────┴──────────┘")
+
+
+def print_last_steps(logger, episode: dict, num_steps: int) -> None:
+    """Print the last N steps of an episode with grid visualization."""
+    if not episode.get("moves"):
+        return
+
+    direction_names = ["UP", "DOWN", "LEFT", "RIGHT"]
+    moves_to_show = episode["moves"][-num_steps:]
+    start_idx = len(episode["moves"]) - len(moves_to_show)
+
+    pts_summary = [str(m.get("points_earned", 0)) for m in moves_to_show]
+    logger.print(f"\n  Last {len(moves_to_show)} steps (pts: {' → '.join(pts_summary)}):")
+
+    for i, move in enumerate(moves_to_show):
+        step_num = start_idx + i + 1
+        action = direction_names[move["selected_direction"]]
+        pts = move.get("points_earned", 0)
+        logger.print(f"\n  Step {step_num}: {action} (+{pts} pts)")
+        if "result_state" in move:
+            logger.print(format_grid(move["result_state"], indent="  "))
+
+
+def print_final_state(logger, episode: dict) -> None:
+    """Print the final game state."""
+    if "final_state" in episode:
+        logger.print("\n  Final state:")
+        logger.print(format_grid(episode["final_state"], indent="  "))
+
+
+def export_episode_visualization(
+    viz_dir: str,
+    train_step: int,
+    episode: dict,
+    weights: RewardWeights,
+    discount_rate: float,
+) -> None:
+    """Export episode data to JSON for visualization."""
+    if not episode.get("moves"):
+        return
+
+    viz_path = Path(viz_dir)
+    viz_path.mkdir(parents=True, exist_ok=True)
+
+    def grid_to_values(grid):
+        return [[2**cell if cell > 0 else 0 for cell in row] for row in grid]
+
+    direction_names = ["UP", "DOWN", "LEFT", "RIGHT"]
+    viz_data = {
+        "step": train_step,
+        "score": episode["total_points"],
+        "total_steps": episode["total_steps"],
+        "moves": [],
+    }
+
+    for i, move in enumerate(episode["moves"]):
+        state_before = move.get("state_before", [])
+        state_after = move.get("result_state", [])
+        move_data = {
+            "step": i + 1,
+            "state_before": grid_to_values(state_before) if state_before else [],
+            "action": direction_names[move["selected_direction"]],
+            "state_after": grid_to_values(state_after) if state_after else [],
+            "points_earned": move.get("points_earned", 0),
+            "rewards": {
+                "points": move.get("points_earned", 0) * weights.points,
+                "smoothness": move.get("smoothness_delta", 0) * weights.smoothness,
+                "tile_bonus": move.get("max_tile_created", 0) * weights.max_tile,
+                "corner": move.get("corner_delta", 0) * weights.corner,
+                "adjacency": move.get("adjacency_delta", 0) * weights.adjacency,
+                "chain": move.get("chain_delta", 0) * weights.chain,
+                "monotonicity": (discount_rate * move.get("monotonicity_after", 0) - move.get("monotonicity_before", 0)) * weights.monotonicity,
+                "topological": move.get("topological_delta", 0) * weights.topological,
+                "emptiness": (discount_rate * move.get("emptiness_after", 0) - move.get("emptiness_before", 0)) * weights.emptiness,
+            },
+            "entropy": move.get("entropy", 0.0),
+            "advantage": move.get("advantage", 0.0),
+        }
+        viz_data["moves"].append(move_data)
+
+    export_file = viz_path / f"step_{train_step:06d}.json"
+    with open(export_file, "w") as f:
+        json.dump(viz_data, f, indent=2)
 
 
 @app.command()
@@ -558,8 +792,8 @@ def train(
     ),
     learning_rate: float = typer.Option(0.001, "--lr", help="Learning rate"),
     gamma: float = typer.Option(0.99, "--gamma", help="Discount factor"),
-    beta: float = typer.Option(
-        0.1, "--beta", help="Parmaeter for controlling entropy regularization."
+    entropy_strength: float = typer.Option(
+        0.1, "--entropy", help="Parmaeter for controlling entropy regularization."
     ),
     critic_strength: float = typer.Option(
         1.0,
@@ -635,6 +869,16 @@ def train(
         "--mono",
         help="Weight for monotonicity score (consistent increase/decrease patterns)",
     ),
+    warmup_steps: int = typer.Option(
+        200,
+        "--warmup-steps",
+        help="Number of warmup steps for the learning rate scheduler",
+    ),
+    emptiness_weight: float = typer.Option(
+        0.0,
+        "--emptiness",
+        help="Weight for emptiness score (prevents model from filling board with points early on)",
+    ),
     topological_weight: float = typer.Option(
         0.0,
         "--topo",
@@ -656,18 +900,91 @@ def train(
         "--rtg-beta",
         help="This is the beta1 used when estimating the moments of the return-to-go",
     ),
+    log_dir: Optional[str] = typer.Option(
+        None,
+        "--log-dir",
+        help="Directory for JSONL logs (default: current directory)",
+    ),
+    use_wandb: bool = typer.Option(
+        False,
+        "--wandb",
+        help="Enable Weights & Biases logging",
+    ),
+    wandb_project: Optional[str] = typer.Option(
+        "2048-rl",
+        "--wandb-project",
+        help="W&B project name",
+    ),
+    wandb_run_name: Optional[str] = typer.Option(
+        None,
+        "--wandb-run",
+        help="W&B run name (auto-generated if not set)",
+    ),
+    eval_freq: Optional[int] = typer.Option(
+        None,
+        "--eval-freq",
+        help="Evaluate model every N training steps (disabled if not set)",
+    ),
+    eval_games: int = typer.Option(
+        100,
+        "--eval-games",
+        help="Number of games to play during evaluation",
+    ),
+    critic_lr: float = typer.Option(
+        0.001,
+        "--critic-lr",
+        help="Learning rate for the critic (estimated reward-to-go) during loss computation",
+    ),
 ):
     """Watch the AI play 2048."""
     device = torch.device("cuda:0" if gpu and torch.cuda.is_available() else "cpu")
+
+    # build config dict for logging
+    train_config = {
+        "steps": steps,
+        "learning_rate": learning_rate,
+        "gamma": gamma,
+        "beta": entropy_strength,
+        "critic_strength": critic_strength,
+        "batch_size": batch_size,
+        "hidden_size": hidden_size,
+        "num_layers": num_layers,
+        "model_type": model_type,
+        "num_heads": num_heads,
+        "num_loops": num_loops,
+        "num_truncated_loops": num_truncated_loops,
+        "points_weight": points_weight,
+        "smoothness_weight": smoothness_weight,
+        "max_tile_weight": max_tile_weight,
+        "corner_weight": corner_weight,
+        "adjacency_weight": adjacency_weight,
+        "chain_weight": chain_weight,
+        "monotonicity_weight": monotonicity_weight,
+        "topological_weight": topological_weight,
+        "win_bonus": win_bonus,
+        "rtg_beta": rtg_beta,
+    }
+
+    # initialize metric logger
+    logger = MetricLogger(
+        log_dir=log_dir,
+        experiment_name=f"train_{model_type}",
+        use_wandb=use_wandb,
+        wandb_project=wandb_project,
+        wandb_run_name=wandb_run_name,
+        wandb_config=train_config,
+    )
+
     if gpu and not torch.cuda.is_available():
-        typer.echo("Warning: --gpu flag set but CUDA is not available, using CPU")
+        logger.print("Warning: --gpu flag set but CUDA is not available, using CPU")
     else:
-        typer.echo(f"Using device: {device}")
+        logger.print(f"Using device: {device}")
 
     model = None
     if model_path:
-        typer.echo(f"Loading model from: {model_path}")
-        typer.echo("this path is not available")
+        logger.print(f"Loading model from: {model_path}")
+        logger.print("this path is not available")
+        logger.close()
         import sys
 
         sys.exit(0)
@@ -675,12 +992,12 @@ def train(
         # Create model based on model_type
         model_type_lower = model_type.lower()
         if model_type_lower == "mlp":
-            typer.echo(
+            logger.print(
                 f"Creating GameMLP model (hidden={hidden_size}, layers={num_layers})"
             )
             model = GameMLP(MLPConfig(hidden_dim=hidden_size, num_layers=num_layers))
         elif model_type_lower == "urm":
-            typer.echo(
+            logger.print(
                 f"Creating GameURM model (hidden={hidden_size}, layers={num_layers}, "
                 f"heads={num_heads}, loops={num_loops}, truncated={num_truncated_loops})"
             )
@@ -694,7 +1011,8 @@ def train(
                 )
             )
         else:
-            typer.echo(f"Unknown model type: {model_type}. Use 'mlp' or 'urm'.")
+            logger.print(f"Unknown model type: {model_type}. Use 'mlp' or 'urm'.")
+            logger.close()
             import sys
 
             sys.exit(1)
@@ -712,7 +1030,18 @@ def train(
         model.action_head.bias.zero_()
 
     optimizer = AdamW(
-        model.parameters(), lr=learning_rate, betas=(0.9, 0.99), weight_decay=0.01
+        model.get_param_groups(value_lr=critic_lr, other_lr=learning_rate),
+        betas=(0.9, 0.999), weight_decay=0.01
+    )
+    # critic_optimizer = AdamW(
+    #     model.value_head.parameters(), lr=critic_lr, betas=(0.9, 0.99), weight_decay=0.01
+    # )
+
+    lr_scheduler = get_scheduler(
+        "cosine",
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=steps,
     )
 
     # Add this before the training loop starts
@@ -786,16 +1115,24 @@ def train(
             adjacency_weight,
             chain_weight,
             monotonicity_weight,
+            emptiness_weight,
             topological_weight,
             win_bonus,
             rtg_beta=rtg_beta,
             rtg_m2=rtg_m2,
             rtg_mu=rtg_mu,
+            rtg_step=train_step+1, # 1-indexed for the correct normalization
         )
 
         # Now we update the model's policy using this rollout
         stats = model_optimize_step(
-            model, rollout_episodes, optimizer, beta, critic_strength, device
+            model,
+            rollout_episodes,
+            optimizer,
+            lr_scheduler,
+            entropy_strength,
+            critic_strength,
+            device,
         )
 
         # Get highest score from batch
@@ -823,270 +1160,90 @@ def train(
         ema_pct_1024 = (1 - ema_decay) * ema_pct_1024 + ema_decay * batch_pct_1024
         ema_pct_2048 = (1 - ema_decay) * ema_pct_2048 + ema_decay * batch_pct_2048
 
-        # Print stats instead of updating progress bar
-        if train_step % print_frequency == 0:
-            # collect per-step metrics
-            all_moves = [m for ep in rollout_episodes for m in ep["moves"]]
-            rewards = [m["reward"] for m in all_moves]
-            advantages = [m["advantage"] for m in all_moves]
-            future_rewards_norm = [m["future_reward"] for m in all_moves]
-            future_rewards = [m["future_reward_raw"] for m in all_moves]
-            value_preds = [m["predicted_future_value"] for m in all_moves]
+        # always compute and log metrics to file/wandb
+        batch_metrics, ema_explained_var = compute_batch_stats(
+            rollout_episodes=rollout_episodes,
+            optimizer_stats=stats,
+            highest_score=highest_score,
+            ema_avg_score=ema_avg_score,
+            ema_pct_512=ema_pct_512,
+            ema_pct_1024=ema_pct_1024,
+            ema_pct_2048=ema_pct_2048,
+            batch_pct_512=batch_pct_512,
+            batch_pct_1024=batch_pct_1024,
+            batch_pct_2048=batch_pct_2048,
+            ema_decay=ema_decay,
+            ema_explained_var=ema_explained_var,
+        )
 
-            # compute variances
-            n = len(rewards)
-            reward_mean = sum(rewards) / n
-            reward_var = sum((r - reward_mean) ** 2 for r in rewards) / n
-            adv_mean = sum(advantages) / n
-            adv_var = sum((a - adv_mean) ** 2 for a in advantages) / n
+        # print_frequency controls stdout; file/wandb always logged
+        should_print = train_step % print_frequency == 0
+        logger.log(batch_metrics, step=train_step, verbose=should_print)
 
-            future_mean = sum(future_rewards) / n
-            future_var = sum((f - future_mean) ** 2 for f in future_rewards) / n
-
-            future_norm_mean = sum(future_rewards_norm) / n
-            future_norm_var = (
-                sum((f - future_norm_mean) ** 2 for f in future_rewards_norm) / n
-            )
-
-            # value prediction stats
-            v_mean = sum(value_preds) / n
-            v_var = sum((v - v_mean) ** 2 for v in value_preds) / n
-
-            # count zero rewards (sparse signal indicator)
-            zero_reward_pct = sum(1 for r in rewards if r == 0) / n * 100
-
-            scores = sorted([ep["total_points"] for ep in rollout_episodes])
-            avg_score = sum(scores) / len(scores)
-            median_score = (
-                scores[len(scores) // 2]
-                if len(scores) % 2 == 1
-                else (scores[len(scores) // 2 - 1] + scores[len(scores) // 2]) / 2
-            )
-
-            typer.echo(f"--- Step {train_step} ---")
-            typer.echo(f"  samples:        {n}")
-            typer.echo(f"  loss:           {stats['loss']:.4f}")
-            typer.echo(f"  policy_loss:    {stats.get('policy_loss', 0):.4f}")
-            typer.echo(f"  entropy_loss:   {stats.get('entropy_loss', 0):.4f}")
-            typer.echo(f"  value_loss:     {stats.get('value_loss', 0):.4f}")
-            typer.echo(f"  grad_norm:      {stats.get('grad_norm', 0):.4f}")
-            typer.echo(f"  entropy:        {stats.get('entropy', 0):.4f}")
-            typer.echo(f"  peak_score:     {highest_score}")
-            typer.echo(f"  avg_score:      {avg_score:.1f} (ema: {ema_avg_score:.1f})")
-            typer.echo(f"  median_score:   {median_score:.1f}")
-            typer.echo(
-                f"  >=512:          {batch_pct_512:.1f}% (ema: {ema_pct_512:.1f}%)"
-            )
-            typer.echo(
-                f"  >=1024:         {batch_pct_1024:.1f}% (ema: {ema_pct_1024:.1f}%)"
-            )
-            typer.echo(
-                f"  >=2048:         {batch_pct_2048:.1f}% (ema: {ema_pct_2048:.1f}%)"
-            )
-            typer.echo(f"  reward_var:     {reward_var:.2f}")
-            typer.echo(f"  future_raw_var: {future_var:.2f}")
-            typer.echo(f"  future_var:     {future_norm_var:.2f}")
-            adv_l2_norm = sum(a**2 for a in advantages) ** 0.5
-            typer.echo(f"  advantage_var:  {adv_var:.2f}")
-            typer.echo(f"  advantage_l2:   {adv_l2_norm:.2f}")
-            typer.echo(f"  reward_mean:    {reward_mean:.2f}")
-            typer.echo(f"  zero_reward%:   {zero_reward_pct:.1f}%")
-            typer.echo(
-                f"  adv_range:      [{min(advantages):.2f}, {max(advantages):.2f}]"
-            )
-            future_norm_std = future_norm_var**0.5
-            adv_std = adv_var**0.5
-            typer.echo(f"  G_norm.mean:    {future_norm_mean:.4f}")
-            typer.echo(f"  G_norm.std:     {future_norm_std:.4f}")
-            typer.echo(
-                f"  G_norm.range:   [{min(future_rewards_norm):.2f}, {max(future_rewards_norm):.2f}]"
-            )
-
-            # critic usefulness: does V reduce variance of A compared to G?
-            # if std(A) < std(G), critic is learning a useful baseline
-            v_std = v_var**0.5
-            future_raw_std = future_var**0.5
-            variance_reduction = (
-                (future_norm_std - adv_std) / future_norm_std * 100
-                if future_norm_std > 0
-                else 0.0
-            )
-            # explained variance: EV = 1 - Var(G - V) / Var(G) = 1 - Var(A) / Var(G)
-            explained_var = (
-                1.0 - adv_var / future_norm_var if future_norm_var > 0 else 0.0
-            )
-            # update EMA for explained variance (only on print steps)
-            ema_explained_var = (
-                1 - ema_decay
-            ) * ema_explained_var + ema_decay * explained_var
-            typer.echo(f"  std(G_raw):     {future_raw_std:.4f}")
-            typer.echo(f"  std(G_norm):    {future_norm_std:.4f}")
-            typer.echo(f"  std(V):         {v_std:.4f}")
-            typer.echo(f"  std(A):         {adv_std:.4f}")
-            typer.echo(f"  var_reduction:  {variance_reduction:.1f}%")
-            typer.echo(
-                f"  explained_var:  {explained_var:.4f} (ema: {ema_explained_var:.4f})"
-            )
-
-            # Find and display the best game from this batch
+        # detailed stdout output only at print_frequency
+        if should_print:
             best_episode = max(rollout_episodes, key=lambda ep: ep["total_points"])
-            typer.echo(
-                f"\n  Best game this batch (score: {best_episode['total_points']}, steps: {best_episode['total_steps']}):"
+            weights = RewardWeights(
+                points=points_weight,
+                smoothness=smoothness_weight,
+                max_tile=max_tile_weight,
+                corner=corner_weight,
+                adjacency=adjacency_weight,
+                chain=chain_weight,
+                monotonicity=monotonicity_weight,
+                emptiness=emptiness_weight,
+                topological=topological_weight,
             )
 
-            # Calculate reward breakdown for best episode
-            if best_episode["moves"]:
-                moves = best_episode["moves"]
-                total_points = sum(m.get("points_earned", 0) for m in moves)
-                total_smoothness = sum(m.get("smoothness_delta", 0) for m in moves)
-                total_tile_bonus = sum(m.get("max_tile_created", 0) for m in moves)
-                total_corner = sum(m.get("corner_delta", 0) for m in moves)
-                total_adjacency = sum(m.get("adjacency_delta", 0) for m in moves)
-                total_chain = sum(m.get("chain_delta", 0) for m in moves)
-                total_topo = sum(m.get("topological_delta", 0) for m in moves)
+            print_episode_breakdown(logger, best_episode, weights, gamma)
 
-                # PBRS monotonicity: telescopes to γ^T * Φ(s_T) - Φ(s_0)
-                mono_initial = moves[0]["monotonicity_before"]
-                mono_final = moves[-1]["monotonicity_after"]
-                mono_net_change = mono_final - mono_initial
-                num_steps = len(moves)
-                # the discount factor raised to the episode length
-                gamma_T = gamma**num_steps
-                # actual PBRS contribution to discounted return
-                mono_pbrs_contribution = gamma_T * mono_final - mono_initial
+            if show_last_steps > 0:
+                print_last_steps(logger, best_episode, show_last_steps)
 
-                # Build reward breakdown table (absolute rewards only)
-                reward_components = [
-                    ("points_earned", total_points, points_weight),
-                    ("smoothness", total_smoothness, smoothness_weight),
-                    ("tile_bonus", total_tile_bonus, max_tile_weight),
-                    ("corner", total_corner, corner_weight),
-                    ("adjacency", total_adjacency, adjacency_weight),
-                    ("chain", total_chain, chain_weight),
-                    ("topological", total_topo, topological_weight),
-                ]
+            print_final_state(logger, best_episode)
 
-                typer.echo("  Reward breakdown:")
-                typer.echo("    ┌─────────────────┬──────────┬────────┬──────────┐")
-                typer.echo("    │ Component       │      Raw │ Weight │ Weighted │")
-                typer.echo("    ├─────────────────┼──────────┼────────┼──────────┤")
-                total_weighted = 0.0
-                for name, raw, weight in reward_components:
-                    weighted = raw * weight
-                    total_weighted += weighted
-                    typer.echo(
-                        f"    │ {name:<15} │ {raw:>8.1f} │ {weight:>6.2f} │ {weighted:>8.1f} │"
-                    )
-                typer.echo("    ├─────────────────┼──────────┼────────┼──────────┤")
-                typer.echo(
-                    f"    │ {'TOTAL':<15} │          │        │ {total_weighted:>8.1f} │"
-                )
-                typer.echo("    └─────────────────┴──────────┴────────┴──────────┘")
+            if viz_dir:
+                export_episode_visualization(viz_dir, train_step, best_episode, weights, gamma)
 
-                # PBRS monotonicity breakdown (shaped reward, telescopes over episode)
-                if monotonicity_weight != 0.0:
-                    typer.echo("")
-                    typer.echo(
-                        f"  PBRS Monotonicity (weight={monotonicity_weight:.2f}, γ={gamma:.4f}):"
-                    )
-                    typer.echo("    ┌───────────────────────┬──────────┐")
-                    typer.echo(f"    │ Φ(s₀) initial         │ {mono_initial:>8.1f} │")
-                    typer.echo(f"    │ Φ(s_T) final          │ {mono_final:>8.1f} │")
-                    typer.echo(
-                        f"    │ Net Δ (final - init)  │ {mono_net_change:>8.1f} │"
-                    )
-                    typer.echo("    ├───────────────────────┼──────────┤")
-                    typer.echo(f"    │ T (episode length)    │ {num_steps:>8d} │")
-                    typer.echo(f"    │ γ^T                   │ {gamma_T:>8.4f} │")
-                    typer.echo("    ├───────────────────────┼──────────┤")
-                    typer.echo(
-                        f"    │ γ^T·Φ(s_T) - Φ(s₀)    │ {mono_pbrs_contribution:>8.2f} │"
-                    )
-                    weighted_pbrs = mono_pbrs_contribution * monotonicity_weight
-                    typer.echo(f"    │ Weighted contribution │ {weighted_pbrs:>8.2f} │")
-                    typer.echo("    └───────────────────────┴──────────┘")
+            logger.print("")
+        
+        if train_step > 0 and eval_freq and train_step % eval_freq == 0:
+            model.eval()
+            typer.echo(f"[Step {train_step}] Evaluating model on {eval_games} games", color="green")
+            eval_episodes = []
+            for _ in tqdm(range(eval_games), desc="evaluating model", total=eval_games):
+                eval_episodes += [play_game_for_episode(model, max_steps=max_steps, device=next(p.device for p in model.parameters()))]
+            
+            # Compute evaluation statistics
+            eval_scores = [ep["total_points"] for ep in eval_episodes]
+            eval_max_score = max(eval_scores)
+            eval_avg_score = sum(eval_scores) / len(eval_scores)
+            eval_median_score = sorted(eval_scores)[len(eval_scores) // 2]
+            eval_max_tiles = [get_max_tile(ep) for ep in eval_episodes]
+            eval_pct_512 = sum(1 for t in eval_max_tiles if t >= 512) / len(eval_episodes) * 100
+            eval_pct_1024 = sum(1 for t in eval_max_tiles if t >= 1024) / len(eval_episodes) * 100
+            eval_pct_2048 = sum(1 for t in eval_max_tiles if t >= 2048) / len(eval_episodes) * 100
+            
+            eval_metrics = {
+                "eval/max_score": eval_max_score,
+                "eval/avg_score": eval_avg_score,
+                "eval/median_score": eval_median_score,
+                "eval/pct_512": eval_pct_512,
+                "eval/pct_1024": eval_pct_1024,
+                "eval/pct_2048": eval_pct_2048,
+            }
+            logger.log(eval_metrics, step=train_step)
+            
+            typer.echo(f"Eval Results - Max: {eval_max_score:.0f}, Avg: {eval_avg_score:.1f}, Median: {eval_median_score:.0f}", color="green")
+            typer.echo(f"Tiles Reached - 512: {eval_pct_512:.1f}%, 1024: {eval_pct_1024:.1f}%, 2048: {eval_pct_2048:.1f}%", color="green")
+            
+            model.train()
 
-            # Show last N steps if requested
-            if show_last_steps > 0 and best_episode["moves"]:
-                direction_names = ["UP", "DOWN", "LEFT", "RIGHT"]
-                moves_to_show = best_episode["moves"][-show_last_steps:]
-                start_idx = len(best_episode["moves"]) - len(moves_to_show)
 
-                # Summary line with points for each step
-                pts_summary = [str(m.get("points_earned", 0)) for m in moves_to_show]
-                typer.echo(
-                    f"\n  Last {len(moves_to_show)} steps (pts: {' → '.join(pts_summary)}):"
-                )
+            
 
-                for i, move in enumerate(moves_to_show):
-                    step_num = start_idx + i + 1
-                    action = direction_names[move["selected_direction"]]
-                    pts = move.get("points_earned", 0)
-                    typer.echo(f"\n  Step {step_num}: {action} (+{pts} pts)")
-                    if "result_state" in move:
-                        typer.echo(format_grid(move["result_state"], indent="  "))
 
-            if "final_state" in best_episode:
-                typer.echo("\n  Final state:")
-                typer.echo(format_grid(best_episode["final_state"], indent="  "))
-
-            # Export visualization data if viz_dir is set
-            if viz_dir and best_episode["moves"]:
-                viz_path = Path(viz_dir)
-                viz_path.mkdir(parents=True, exist_ok=True)
-
-                # Convert grid from exponents to actual tile values
-                def grid_to_values(grid):
-                    return [
-                        [2**cell if cell > 0 else 0 for cell in row] for row in grid
-                    ]
-
-                direction_names = ["UP", "DOWN", "LEFT", "RIGHT"]
-                viz_data = {
-                    "step": train_step,
-                    "score": best_episode["total_points"],
-                    "total_steps": best_episode["total_steps"],
-                    "moves": [],
-                }
-
-                for i, move in enumerate(best_episode["moves"]):
-                    state_before = move.get("state_before", [])
-                    state_after = move.get("result_state", [])
-                    move_data = {
-                        "step": i + 1,
-                        "state_before": grid_to_values(state_before)
-                        if state_before
-                        else [],
-                        "action": direction_names[move["selected_direction"]],
-                        "state_after": grid_to_values(state_after)
-                        if state_after
-                        else [],
-                        "points_earned": move.get("points_earned", 0),
-                        "rewards": {
-                            "points": move.get("points_earned", 0) * points_weight,
-                            "smoothness": move.get("smoothness_delta", 0)
-                            * smoothness_weight,
-                            "tile_bonus": move.get("max_tile_created", 0)
-                            * max_tile_weight,
-                            "corner": move.get("corner_delta", 0) * corner_weight,
-                            "adjacency": move.get("adjacency_delta", 0)
-                            * adjacency_weight,
-                            "chain": move.get("chain_delta", 0) * chain_weight,
-                            "monotonicity": move.get("monotonicity_delta", 0)
-                            * monotonicity_weight,
-                            "topological": move.get("topological_delta", 0)
-                            * topological_weight,
-                        },
-                        "entropy": move.get("entropy", 0.0),
-                        "advantage": move.get("advantage", 0.0),
-                    }
-                    viz_data["moves"].append(move_data)
-
-                export_file = viz_path / f"step_{train_step:06d}.json"
-                with open(export_file, "w") as f:
-                    json.dump(viz_data, f, indent=2)
-
-            typer.echo("")  # Blank line for readability
+    logger.close()
 
 
 @app.command()

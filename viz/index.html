@@ -114,6 +114,38 @@
             font-weight: 500;
         }
 
+        .sidebar-footer {
+            padding: 12px;
+            border-top: 1px solid var(--border);
+        }
+
+        .btn-clear {
+            width: 100%;
+            background: transparent;
+            border: 1px solid #f85149;
+            color: #f85149;
+            padding: 10px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.875rem;
+            font-weight: 500;
+            transition: all 0.15s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+        }
+
+        .btn-clear:hover {
+            background: rgba(248, 81, 73, 0.1);
+        }
+
+        .btn-clear:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
         /* Main content */
         .main {
             margin-left: 280px;
@@ -435,6 +467,11 @@
                 <div class="spinner"></div>
                 <span>Loading checkpoints...</span>
             </div>
+        </div>
+        <div class="sidebar-footer">
+            <button class="btn-clear" id="btnClearHistory" title="Delete all saved checkpoints">
+                🗑️ Clear History
+            </button>
         </div>
     </aside>
 
@@ -851,6 +888,33 @@
                     break;
             }
         });
+
+        // Clear history button
+        document.getElementById('btnClearHistory').onclick = async () => {
+            if (!confirm('Delete all saved checkpoints? This cannot be undone.')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/clear', { method: 'POST' });
+                const data = await response.json();
+                
+                // reset state
+                currentData = null;
+                currentStep = 0;
+                stopPlay();
+                
+                // show empty state
+                emptyState.style.display = 'flex';
+                gameContainer.style.display = 'none';
+                
+                // refresh the checkpoint list
+                fetchCheckpoints();
+            } catch (error) {
+                console.error('Error clearing history:', error);
+                alert('Failed to clear history');
+            }
+        };
 
         // Initialize
         fetchCheckpoints();

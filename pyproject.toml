@@ -93,6 +93,7 @@ dependencies = [
     "typing-inspection==0.4.2",
     "uvicorn==0.38.0",
     "uvloop==0.22.1",
+    "wandb>=0.23.1",
     "watchfiles==1.1.1",
     "wcwidth==0.2.14",
     "websockets==15.0.1",
