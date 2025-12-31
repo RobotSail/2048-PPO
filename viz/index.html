@@ -72,6 +72,27 @@
             margin-top: 4px;
         }
 
+        .sort-controls {
+            margin-top: 12px;
+        }
+
+        .sort-controls select {
+            width: 100%;
+            background: var(--bg-hover);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 8px 10px;
+            border-radius: 6px;
+            font-family: inherit;
+            font-size: 0.8rem;
+            cursor: pointer;
+        }
+
+        .sort-controls select:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
         .checkpoint-list {
             flex: 1;
             overflow-y: auto;
@@ -119,6 +140,48 @@
             border-top: 1px solid var(--border);
         }
 
+        .pagination {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 12px;
+            border-top: 1px solid var(--border);
+            background: var(--bg-card);
+        }
+
+        .pagination-btn {
+            background: var(--bg-hover);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            width: 32px;
+            height: 32px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.875rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.15s;
+        }
+
+        .pagination-btn:hover:not(:disabled) {
+            background: var(--accent-dim);
+            border-color: var(--accent);
+        }
+
+        .pagination-btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .pagination-info {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            min-width: 80px;
+            text-align: center;
+        }
+
         .btn-clear {
             width: 100%;
             background: transparent;
@@ -144,6 +207,30 @@
         .btn-clear:disabled {
             opacity: 0.5;
             cursor: not-allowed;
+        }
+
+        .btn-refresh {
+            width: 100%;
+            background: var(--bg-hover);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 10px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 0.875rem;
+            font-weight: 500;
+            transition: all 0.15s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            margin-bottom: 8px;
+        }
+
+        .btn-refresh:hover {
+            background: var(--accent-dim);
+            border-color: var(--accent);
         }
 
         /* Main content */
@@ -461,6 +548,14 @@
         <div class="sidebar-header">
             <h1>2048 Visualizer</h1>
             <p>Training run explorer</p>
+            <div class="sort-controls">
+                <select id="sortSelect">
+                    <option value="step_desc">Step (newest first)</option>
+                    <option value="step_asc">Step (oldest first)</option>
+                    <option value="score_desc">Score (highest first)</option>
+                    <option value="score_asc">Score (lowest first)</option>
+                </select>
+            </div>
         </div>
         <div class="checkpoint-list" id="checkpointList">
             <div class="loading">
@@ -468,7 +563,15 @@
                 <span>Loading checkpoints...</span>
             </div>
         </div>
+        <div class="pagination" id="pagination" style="display: none;">
+            <button class="pagination-btn" id="btnPrevPage" title="Previous page">◀</button>
+            <span class="pagination-info" id="pageInfo">1 / 1</span>
+            <button class="pagination-btn" id="btnNextPage" title="Next page">▶</button>
+        </div>
         <div class="sidebar-footer">
+            <button class="btn-refresh" id="btnRefresh" title="Refresh checkpoint list">
+                🔄 Refresh
+            </button>
             <button class="btn-clear" id="btnClearHistory" title="Delete all saved checkpoints">
                 🗑️ Clear History
             </button>
@@ -566,6 +669,11 @@
         let isPlaying = false;
         let playInterval = null;
         let playSpeed = 500;
+        
+        // Pagination state
+        let currentPage = 1;
+        let totalPages = 1;
+        let currentSort = 'step_desc';
 
         // Elements
         const checkpointList = document.getElementById('checkpointList');
@@ -750,13 +858,23 @@
             }
         }
 
-        // Fetch and render checkpoint list
-        async function fetchCheckpoints() {
+        // Fetch and render checkpoint list with pagination
+        async function fetchCheckpoints(page = currentPage, sort = currentSort) {
             try {
-                const response = await fetch('/api/files');
+                const response = await fetch(`/api/files?page=${page}&per_page=20&sort=${sort}`);
                 const data = await response.json();
                 
-                if (data.files.length === 0) {
+                // Update pagination state
+                currentPage = data.page;
+                totalPages = data.pages;
+                
+                // Update pagination UI
+                const pagination = document.getElementById('pagination');
+                const pageInfo = document.getElementById('pageInfo');
+                const btnPrevPage = document.getElementById('btnPrevPage');
+                const btnNextPage = document.getElementById('btnNextPage');
+                
+                if (data.total === 0) {
                     checkpointList.innerHTML = `
                         <div style="padding: 20px; text-align: center; color: var(--text-secondary);">
                             <p style="font-size: 0.875rem;">No checkpoints found</p>
@@ -765,11 +883,19 @@
                             </p>
                         </div>
                     `;
+                    pagination.style.display = 'none';
                     return;
                 }
                 
-                // Sort by step number (descending)
-                data.files.sort((a, b) => b.step - a.step);
+                // Show pagination if more than one page
+                if (totalPages > 1) {
+                    pagination.style.display = 'flex';
+                    pageInfo.textContent = `${currentPage} / ${totalPages}`;
+                    btnPrevPage.disabled = currentPage <= 1;
+                    btnNextPage.disabled = currentPage >= totalPages;
+                } else {
+                    pagination.style.display = 'none';
+                }
                 
                 checkpointList.innerHTML = data.files.map(file => `
                     <div class="checkpoint-item" data-filename="${file.filename}" onclick="loadCheckpoint('${file.filename}')">
@@ -780,6 +906,16 @@
                         </div>
                     </div>
                 `).join('');
+                
+                // Re-highlight active checkpoint if still in list
+                if (currentData) {
+                    document.querySelectorAll('.checkpoint-item').forEach(item => {
+                        const stepMatch = item.querySelector('.checkpoint-step').textContent;
+                        if (stepMatch === `Step ${currentData.step}`) {
+                            item.classList.add('active');
+                        }
+                    });
+                }
             } catch (error) {
                 console.error('Error fetching checkpoints:', error);
                 checkpointList.innerHTML = `
@@ -889,6 +1025,31 @@
             }
         });
 
+        // Pagination controls
+        document.getElementById('btnPrevPage').onclick = () => {
+            if (currentPage > 1) {
+                fetchCheckpoints(currentPage - 1, currentSort);
+            }
+        };
+
+        document.getElementById('btnNextPage').onclick = () => {
+            if (currentPage < totalPages) {
+                fetchCheckpoints(currentPage + 1, currentSort);
+            }
+        };
+
+        // Sort control
+        document.getElementById('sortSelect').onchange = (e) => {
+            currentSort = e.target.value;
+            currentPage = 1;  // reset to first page when sorting changes
+            fetchCheckpoints(1, currentSort);
+        };
+
+        // Refresh button
+        document.getElementById('btnRefresh').onclick = () => {
+            fetchCheckpoints(currentPage, currentSort);
+        };
+
         // Clear history button
         document.getElementById('btnClearHistory').onclick = async () => {
             if (!confirm('Delete all saved checkpoints? This cannot be undone.')) {
@@ -902,6 +1063,7 @@
                 // reset state
                 currentData = null;
                 currentStep = 0;
+                currentPage = 1;
                 stopPlay();
                 
                 // show empty state
@@ -909,7 +1071,7 @@
                 gameContainer.style.display = 'none';
                 
                 // refresh the checkpoint list
-                fetchCheckpoints();
+                fetchCheckpoints(1, currentSort);
             } catch (error) {
                 console.error('Error clearing history:', error);
                 alert('Failed to clear history');
@@ -917,10 +1079,10 @@
         };
 
         // Initialize
-        fetchCheckpoints();
+        fetchCheckpoints(1, currentSort);
         
-        // Poll for new checkpoints every 2 seconds
-        setInterval(fetchCheckpoints, 2000);
+        // Poll for new checkpoints every minute (less aggressive than before)
+        setInterval(() => fetchCheckpoints(currentPage, currentSort), 60000);
     </script>
 </body>
 </html>

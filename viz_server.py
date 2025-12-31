@@ -8,7 +8,7 @@ Usage: python viz_server.py [--port PORT] [--viz-dir DIR]
 import argparse
 import json
 from pathlib import Path
-from flask import Flask, jsonify, send_from_directory, abort
+from flask import Flask, jsonify, send_from_directory, abort, request
 
 app = Flask(__name__, static_folder="viz")
 
@@ -24,11 +24,19 @@ def index():
 
 @app.route("/api/files")
 def list_files():
-    """List all available visualization data files."""
+    """List available visualization data files with pagination and sorting."""
     if not VIZ_DATA_DIR.exists():
-        return jsonify({"files": []})
+        return jsonify({"files": [], "total": 0, "page": 1, "per_page": 20, "pages": 0})
     
-    files = sorted(VIZ_DATA_DIR.glob("*.json"))
+    # pagination params
+    page = request.args.get("page", 1, type=int)
+    per_page = request.args.get("per_page", 20, type=int)
+    per_page = min(per_page, 100)  # cap at 100 per page
+    
+    # sorting params: "step_asc", "step_desc", "score_asc", "score_desc"
+    sort_by = request.args.get("sort", "step_desc")
+    
+    files = list(VIZ_DATA_DIR.glob("*.json"))
     file_list = []
     for f in files:
         try:
@@ -43,7 +51,34 @@ def list_files():
         except (json.JSONDecodeError, IOError):
             continue
     
-    return jsonify({"files": file_list})
+    # apply sorting
+    if sort_by == "step_asc":
+        file_list.sort(key=lambda x: x["step"])
+    elif sort_by == "step_desc":
+        file_list.sort(key=lambda x: x["step"], reverse=True)
+    elif sort_by == "score_asc":
+        file_list.sort(key=lambda x: x["score"])
+    elif sort_by == "score_desc":
+        file_list.sort(key=lambda x: x["score"], reverse=True)
+    else:
+        file_list.sort(key=lambda x: x["step"], reverse=True)
+    
+    # calculate pagination
+    total = len(file_list)
+    pages = (total + per_page - 1) // per_page if per_page > 0 else 0
+    page = max(1, min(page, pages)) if pages > 0 else 1
+    
+    start = (page - 1) * per_page
+    end = start + per_page
+    paginated = file_list[start:end]
+    
+    return jsonify({
+        "files": paginated,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "pages": pages,
+    })
 
 
 @app.route("/api/data/<filename>")
