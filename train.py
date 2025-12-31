@@ -2,6 +2,7 @@
 CLI training interface for 2048 AI agent.
 Run with: python train.py [command]
 """
+from copy import deepcopy
 
 import json
 import random
@@ -10,7 +11,7 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import NotRequired, Optional, TypedDict
 from tqdm import tqdm
 
 from transformers import get_scheduler
@@ -22,8 +23,63 @@ from torch.optim import AdamW
 from tqdm import tqdm
 
 
-from game import Game2048, Direction, GameMLP, MLPConfig, GameURM, GameURMConfig
+from game import Game2048, Direction, GameMLP, MLPConfig, GameURM, GameURMConfig, Grid
 from logger import MetricLogger
+
+
+class StepData(TypedDict, total=False):
+    """
+    Schema for per-step data collected during gameplay and enriched during advantage calculation.
+    
+    Fields are grouped by when they're populated:
+    - Gameplay fields: set in play_game_for_episode()
+    - Advantage fields: set in calculate_advantage()
+    
+    Using total=False allows incremental construction while still providing type hints.
+    """
+    # gameplay: model predictions
+    predicted_future_value: float
+    selected_direction: int  # index into Direction enum (0=UP, 1=DOWN, 2=LEFT, 3=RIGHT)
+    game_state: torch.Tensor  # flattened model input (48,)
+    action_mask: list[bool]  # True = invalid action
+    entropy: float  # action distribution entropy
+    
+    # gameplay: game state
+    state_before: Grid  # raw grid before move
+    result_state: Grid  # raw grid after move
+    points_earned: int  # points from this move
+    max_points_possible: int  # best possible points this turn
+    points_possible: dict[Direction, int]  # points per direction
+    
+    # gameplay: heuristic deltas
+    smoothness_delta: float
+    max_tile_created: int  # exponent of highest tile created this move
+    max_exponent_before: int
+    max_exponent_after: int
+    corner_delta: float
+    adjacency_delta: float
+    chain_delta: float
+    monotonicity_before: float
+    monotonicity_after: float
+    emptiness_before: float
+    emptiness_after: float
+    topological_delta: float
+    topological_anchor: tuple[int, int] | None  # not used
+    
+    # advantage calculation: set in calculate_advantage()
+    reward: float  # immediate reward (absolute + shaped)
+    future_reward_raw: float  # discounted return-to-go (unnormalized)
+    future_reward: float  # normalized return-to-go
+    advantage: float  # future_reward - predicted_future_value
+
+
+class EpisodeData(TypedDict):
+    """Schema for a complete episode/rollout."""
+    moves: list[StepData]
+    total_points: int
+    total_steps: int
+    final_state: Grid
+
 
 app = typer.Typer(help="Train and evaluate 2048 AI agents")
 
@@ -60,18 +116,25 @@ def format_grid(grid: list[list[int]], indent: str = "  ") -> str:
 
 @torch.no_grad
 def play_game_for_episode(
-    model: torch.nn.Module, max_steps: int | None = None, device: torch.device = None
-) -> dict:
+    # actor_model: torch.nn.Module,
+    # critic_model: torch.nn.Module,
+    model: torch.nn.Module,
+    max_steps: int | None = None,
+    device: torch.device = None,
+    seed: int | None = None,
+) -> EpisodeData:
     """
     Given a model, play an episode of a game.
+    
+    If seed is provided, the game will be deterministic (useful for evaluation).
     """
-    # ----------------------------------------
-    # initialize game
+    if seed is not None:
+        random.seed(seed)
+    
     game = Game2048()
     game.reset()
 
-    # stores the data generated from each episode per rollout
-    game_data = []
+    game_data: list[StepData] = []
     move_count = 0
     total_points = 0
 
@@ -81,7 +144,7 @@ def play_game_for_episode(
     while game.has_next_step() and (
         not max_steps or (max_steps > 0 and step < max_steps)
     ):
-        step_data = {}
+        step_data: StepData = {}
 
         # find valid directions
         valid_directions = [d for d in Direction if game.direction_has_step(d)]
@@ -101,6 +164,8 @@ def play_game_for_episode(
         model_input = game.to_model_format()
         if device is not None:
             model_input = model_input.to(device)
+        # action_logits, _ = actor_model(model_input.unsqueeze(0))
+        # _, predicted_future_value = critic_model(model_input.unsqueeze(0))
         action_logits, predicted_future_value = model(model_input.unsqueeze(0))
 
         # we interret the directions as being UP/DOWN/LEFT/RIGHT:
@@ -124,6 +189,7 @@ def play_game_for_episode(
             from IPython import embed
 
             embed()
+        # action: Direction = actor_model.directions[selected_action]
         action: Direction = model.directions[selected_action]
 
         # compute entropy of the action distribution (model's uncertainty)
@@ -161,7 +227,6 @@ def play_game_for_episode(
         step_data["emptiness_before"] = info["emptiness_before"]
         step_data["emptiness_after"] = info["emptiness_after"] if not done else 0.0
         step_data["topological_delta"] = info.get("topological_delta", 0.0)
-        step_data["topological_anchor"] = info.get("topological_anchor")
         step_data["entropy"] = step_entropy
 
         # save the data generated at the current step
@@ -175,17 +240,16 @@ def play_game_for_episode(
 
         step += 1
 
-    # add the rollout data
-    episode_data = {
+    episode_data: EpisodeData = {
         "moves": game_data,
         "total_points": total_points,
         "total_steps": step,
-        "final_state": new_state,  # Store the final grid for logging
+        "final_state": new_state,
     }
     return episode_data
 
 
-def _worker_play_game(args: tuple) -> dict:
+def _worker_play_game(args: tuple) -> EpisodeData:
     """
     Worker function for multiprocessing.
     Reconstructs model from state dict and plays a game.
@@ -199,10 +263,16 @@ def _worker_play_game(args: tuple) -> dict:
 
 
 def model_optimize_step(
+    # actor_model: torch.nn.Module,
+    # critic_model: torch.nn.Module,
     model: torch.nn.Module,
-    episodes: list[dict],
+    episodes: list[EpisodeData],
+    # actor_optimizer: torch.optim.Optimizer,
+    # critic_optimizer: torch.optim.Optimizer,
     optimizer: torch.optim.Optimizer,
-    lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
+    # actor_lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
+    # critic_lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
     beta: float = 0.1,
     critic_strength: float = 1.0,
     device: torch.device = None,
@@ -242,11 +312,17 @@ def model_optimize_step(
         advantage = advantage.to(device)
 
     # now that the data is prepared, we compute the loss and take an optimizer step
+    # actor_model.train()
+    # critic_model.train()
     model.train()
 
-    action_logits, value_logits = model(
-        inputs=input_batch,
-    )
+    # action_logits, _ = actor_model(
+    #     inputs=input_batch,
+    # )
+    # _, value_logits = critic_model(
+    #     inputs=input_batch,
+    # )
+    action_logits, value_logits = model(input_batch)
 
     targets = target_batch.to(device=action_logits.device)
 
@@ -281,19 +357,32 @@ def model_optimize_step(
     loss.backward()
 
     # clip gradnorm and take an optimizer step
+    # actor_grad_norm = torch.nn.utils.clip_grad_norm_(actor_model.parameters(), 1.0)
+    # critic_grad_norm = torch.nn.utils.clip_grad_norm_(critic_model.parameters(), 1.0)
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # grad_norm = actor_grad_norm + critic_grad_norm
+    # actor_optimizer.step()
+    # critic_optimizer.step()
+    # actor_optimizer.zero_grad()
+    # critic_optimizer.zero_grad()
     optimizer.step()
     optimizer.zero_grad()
+    # current_lr = actor_lr_scheduler.get_last_lr()[0] if actor_lr_scheduler is not None else 0.0
+    # critic_current_lr = critic_lr_scheduler.get_last_lr()[0] if critic_lr_scheduler is not None else 0.0
+    # if actor_lr_scheduler is not None:
+    #     actor_lr_scheduler.step()
+    # if critic_lr_scheduler is not None:
+    #     critic_lr_scheduler.step()
     current_lr = lr_scheduler.get_last_lr()[0] if lr_scheduler is not None else 0.0
-    if lr_scheduler is not None:
-        lr_scheduler.step()
+    lr_scheduler.step()
     
     # here we compute KL(old||new)
     with torch.no_grad():
         # new policy
-        new_action_logits, new_value_logits = model(
-            inputs=input_batch
-        )
+        # new_action_logits, _ = actor_model(
+        #     inputs=input_batch
+        # )
+        new_action_logits, _ = model(input_batch)
         new_action_logits: torch.Tensor = new_action_logits
         new_action_logits = torch.masked_fill(new_action_logits, action_mask, float('-inf'))
 
@@ -318,11 +407,15 @@ def model_optimize_step(
         "policy_loss": policy_loss.detach().cpu().item(),
         "entropy_loss": entropy_loss.detach().cpu().item(),
         "value_loss": value_loss.detach().cpu().item(),
-        "grad_norm": grad_norm,
+        # "actor_grad_norm": actor_grad_norm.detach().cpu().item(),
+        # "critic_grad_norm": critic_grad_norm.detach().cpu().item(),
+        "grad_norm": grad_norm.detach().cpu().item(),
         "entropy": entropy_per_sample.mean().detach().cpu().item(),
         "kl_total": per_sample_kl.sum().detach().cpu().item(),
         "kl_average": per_sample_kl.mean().detach().cpu().item(),
         "kl_max": per_sample_kl.max().detach().cpu().item(),
+        # "actor_lr": current_lr,
+        # "critic_lr": critic_current_lr,
         "lr": current_lr,
     }
     return stats
@@ -335,7 +428,7 @@ def model_optimize_step(
 
 
 def calculate_advantage(
-    episodes: list[dict],
+    episodes: list[EpisodeData],
     discount_rate: float,
     rtg_first_moment: float,
     points_weight: float = 1.0,
@@ -348,11 +441,12 @@ def calculate_advantage(
     emptiness_weight: float = 1.0,
     topological_weight: float = 1.0,
     win_bonus: float = 1000.0,
-    rtg_beta=0.9,
-    rtg_m2=1.0,
-    rtg_mu=0.0,
-    rtg_step=1,
-) -> tuple[list[dict], float, float, float]:
+    rtg_beta: float = 0.9,
+    rtg_m2: float = 1.0,
+    rtg_mu: float = 0.0,
+    rtg_step: int = 1,
+    upsample_ratio: float = 0.0,
+) -> tuple[list[EpisodeData], list[StepData], float, float, float]:
     """
     Calculate per-step advantage for policy gradient.
 
@@ -469,6 +563,100 @@ def calculate_advantage(
 
             # computed in the normalized space
             m["advantage"] = m["future_reward"] - baseline
+    
+    # create new samples via augmentation (mirroring and rotation)
+    augmented_steps: list[StepData] = []
+    steps_to_upsample = int(N * upsample_ratio)
+    if steps_to_upsample > 0:
+        flattened_steps = [m for ep in episodes for m in ep["moves"]]
+        sampled_steps = random.sample(flattened_steps, min(steps_to_upsample, len(flattened_steps)))
+
+        # direction indices: 0=UP, 1=DOWN, 2=LEFT, 3=RIGHT
+        dirs = [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT]
+        
+        def remap_direction_mirror(dir_idx: int, mirror_axis: str) -> int:
+            """Remap direction index after mirroring."""
+            d = dirs[dir_idx]
+            if mirror_axis == "horizontal" and d in [Direction.LEFT, Direction.RIGHT]:
+                new_d = Direction.LEFT if d == Direction.RIGHT else Direction.RIGHT
+            elif mirror_axis == "vertical" and d in [Direction.UP, Direction.DOWN]:
+                new_d = Direction.UP if d == Direction.DOWN else Direction.DOWN
+            else:
+                return dir_idx
+            return dirs.index(new_d)
+        
+        def remap_direction_rotate(dir_idx: int, degrees: int) -> int:
+            """Remap direction index after clockwise rotation."""
+            # rotation maps: 90° CW: UP->RIGHT, RIGHT->DOWN, DOWN->LEFT, LEFT->UP
+            rotate_90 = {
+                Direction.UP: Direction.RIGHT,
+                Direction.RIGHT: Direction.DOWN,
+                Direction.DOWN: Direction.LEFT,
+                Direction.LEFT: Direction.UP,
+            }
+            d = dirs[dir_idx]
+            rotations = degrees // 90
+            for _ in range(rotations):
+                d = rotate_90[d]
+            return dirs.index(d)
+        
+        def remap_action_mask(mask: list[bool], remap_fn, *args) -> list[bool]:
+            """Remap action mask using the same direction remapping."""
+            new_mask = [False] * 4
+            for old_idx in range(4):
+                new_idx = remap_fn(old_idx, *args)
+                new_mask[new_idx] = mask[old_idx]
+            return new_mask
+
+        for step in sampled_steps:
+            # chance of mirroring
+            if random.random() < 0.5:
+                augmented_step: StepData = deepcopy(step)
+                old_state_before = augmented_step.pop("state_before")
+                old_state_after = augmented_step.pop("result_state")
+                _ = augmented_step.pop("game_state", None)
+
+                mirror_axis = random.choice(["horizontal", "vertical"])
+                mirrored_before = Game2048.mirror_grid(old_state_before, mirror_axis)
+                mirrored_after = Game2048.mirror_grid(old_state_after, mirror_axis)
+                
+                augmented_step["state_before"] = mirrored_before
+                augmented_step["result_state"] = mirrored_after
+                augmented_step["game_state"] = Game2048(mirrored_before).to_model_format()
+                augmented_step["points_possible"] = Game2048(mirrored_before).preview_move_rewards()
+                
+                old_dir_idx = augmented_step.pop("selected_direction")
+                augmented_step["selected_direction"] = remap_direction_mirror(old_dir_idx, mirror_axis)
+                
+                old_mask = augmented_step.pop("action_mask", [False] * 4)
+                augmented_step["action_mask"] = remap_action_mask(old_mask, remap_direction_mirror, mirror_axis)
+                
+                augmented_steps.append(augmented_step)
+            
+            # chance of rotation (independent of mirroring, uses original step)
+            if random.random() < 0.5:
+                augmented_step: StepData = deepcopy(step)
+                old_state_before = augmented_step.pop("state_before")
+                old_state_after = augmented_step.pop("result_state")
+                _ = augmented_step.pop("game_state", None)
+
+                degrees = random.choice([90, 180, 270])
+                rotated_before = Game2048.rotate_grid(old_state_before, degrees)
+                rotated_after = Game2048.rotate_grid(old_state_after, degrees)
+                
+                augmented_step["state_before"] = rotated_before
+                augmented_step["result_state"] = rotated_after
+                augmented_step["game_state"] = Game2048(rotated_before).to_model_format()
+                augmented_step["points_possible"] = Game2048(rotated_before).preview_move_rewards()
+                
+                old_dir_idx = augmented_step.pop("selected_direction")
+                augmented_step["selected_direction"] = remap_direction_rotate(old_dir_idx, degrees)
+                
+                old_mask = augmented_step.pop("action_mask", [False] * 4)
+                augmented_step["action_mask"] = remap_action_mask(old_mask, remap_direction_rotate, degrees)
+                
+                augmented_steps.append(augmented_step)
+
 
     # # stabilize policy updates: center and scale advantages within the batch
     # advantages = [m["advantage"] for ep in episodes for m in ep["moves"]]
@@ -494,7 +682,7 @@ def calculate_advantage(
 
 
     # we return the new moments
-    return episodes, rtg_updated_first_moment, rtg_updated_m2, rtg_updated_mu
+    return episodes, augmented_steps, rtg_updated_first_moment, rtg_updated_m2, rtg_updated_mu
 
 
 @dataclass
@@ -512,7 +700,7 @@ class RewardWeights:
 
 
 def compute_batch_stats(
-    rollout_episodes: list[dict],
+    rollout_episodes: list[EpisodeData],
     optimizer_stats: dict,
     highest_score: int,
     ema_avg_score: float,
@@ -529,7 +717,7 @@ def compute_batch_stats(
     Compute all batch statistics for logging.
     Returns (metrics_dict, updated_ema_explained_var).
     """
-    all_moves = [m for ep in rollout_episodes for m in ep["moves"]]
+    all_moves = [m for ep in rollout_episodes for m in ep["moves"] if not ep.get("augmented", False)]
     rewards = [m["reward"] for m in all_moves]
     advantages = [m["advantage"] for m in all_moves]
     future_rewards_norm = [m["future_reward"] for m in all_moves]
@@ -572,13 +760,24 @@ def compute_batch_stats(
     explained_var = 1.0 - adv_var / future_norm_var if future_norm_var > 0 else 0.0
     updated_ema_explained_var = (1 - ema_decay) * ema_explained_var + ema_decay * explained_var
 
+    augmented_episode = [ep for ep in rollout_episodes if ep.get("augmented", False)]
+    if len(augmented_episode) > 0:
+        augmented_samples = len(augmented_episode[0]["moves"])
+    else:
+        augmented_samples = 0
+
     metrics = {
         "samples": n,
-        "loss": optimizer_stats["loss"],
+        "augmented_samples": augmented_samples,
+        "actor_loss": optimizer_stats.get("actor_loss", 0),
+        "critic_loss": optimizer_stats.get("critic_loss", 0),
+        "total_loss": optimizer_stats.get("total_loss", 0),
         "policy_loss": optimizer_stats.get("policy_loss", 0),
         "entropy_loss": optimizer_stats.get("entropy_loss", 0),
         "value_loss": optimizer_stats.get("value_loss", 0),
-        "grad_norm": float(optimizer_stats.get("grad_norm", 0)),
+        "actor_grad_norm": optimizer_stats.get("actor_grad_norm", 0),
+        "critic_grad_norm": optimizer_stats.get("critic_grad_norm", 0),
+        "grad_norm": optimizer_stats.get("grad_norm", 0),
         "entropy": optimizer_stats.get("entropy", 0),
         "peak_score": highest_score,
         "avg_score": avg_score,
@@ -610,14 +809,15 @@ def compute_batch_stats(
         "kl_total": optimizer_stats.get("kl_total", 0),
         "kl_average": optimizer_stats.get("kl_average", 0),
         "kl_max": optimizer_stats.get("kl_max", 0),
-        "learning_rate": optimizer_stats.get("lr", 0),
+        "actor_lr": optimizer_stats.get("actor_lr", 0),
+        "critic_lr": optimizer_stats.get("critic_lr", 0),
     }
     return metrics, updated_ema_explained_var
 
 
 def print_episode_breakdown(
     logger,
-    episode: dict,
+    episode: EpisodeData,
     weights: RewardWeights,
     gamma: float,
 ) -> None:
@@ -701,7 +901,7 @@ def print_episode_breakdown(
         logger.print("    └─────────────┴──────────┴──────────┴────────┴──────────┘")
 
 
-def print_last_steps(logger, episode: dict, num_steps: int) -> None:
+def print_last_steps(logger, episode: EpisodeData, num_steps: int) -> None:
     """Print the last N steps of an episode with grid visualization."""
     if not episode.get("moves"):
         return
@@ -722,7 +922,7 @@ def print_last_steps(logger, episode: dict, num_steps: int) -> None:
             logger.print(format_grid(move["result_state"], indent="  "))
 
 
-def print_final_state(logger, episode: dict) -> None:
+def print_final_state(logger, episode: EpisodeData) -> None:
     """Print the final game state."""
     if "final_state" in episode:
         logger.print("\n  Final state:")
@@ -732,7 +932,7 @@ def print_final_state(logger, episode: dict) -> None:
 def export_episode_visualization(
     viz_dir: str,
     train_step: int,
-    episode: dict,
+    episode: EpisodeData,
     weights: RewardWeights,
     discount_rate: float,
 ) -> None:
@@ -782,6 +982,10 @@ def export_episode_visualization(
     export_file = viz_path / f"step_{train_step:06d}.json"
     with open(export_file, "w") as f:
         json.dump(viz_data, f, indent=2)
+
+
+
+
 
 
 @app.command()
@@ -935,6 +1139,16 @@ def train(
         "--critic-lr",
         help="Learning rate for the critic (estimated reward-to-go) during loss computation",
     ),
+    decouple_critic: bool = typer.Option(
+        False,
+        "--decouple-critic",
+        help="Decouple the critic from the compute graph",
+    ),
+    upsample_ratio: float = typer.Option(
+        0.0,
+        "--upsample-ratio",
+        help="Ratio of samples to upsample for data augmentation",
+    ),
 ):
     """Watch the AI play 2048."""
     device = torch.device("cuda:0" if gpu and torch.cuda.is_available() else "cpu")
@@ -995,21 +1209,27 @@ def train(
             logger.print(
                 f"Creating GameMLP model (hidden={hidden_size}, layers={num_layers})"
             )
-            model = GameMLP(MLPConfig(hidden_dim=hidden_size, num_layers=num_layers))
+            # actor_model = GameMLP(MLPConfig(hidden_dim=hidden_size, num_layers=num_layers))
+            # critic_model = GameMLP(MLPConfig(hidden_dim=hidden_size, num_layers=num_layers, decouple_critic=False))
+            model = GameMLP(MLPConfig(hidden_dim=hidden_size, num_layers=num_layers, decouple_critic=decouple_critic))
         elif model_type_lower == "urm":
             logger.print(
                 f"Creating GameURM model (hidden={hidden_size}, layers={num_layers}, "
                 f"heads={num_heads}, loops={num_loops}, truncated={num_truncated_loops})"
             )
-            model = GameURM(
-                GameURMConfig(
-                    hidden_dim=hidden_size,
-                    num_layers=num_layers,
-                    num_heads=num_heads,
-                    num_loops=num_loops,
-                    num_truncated_loops=num_truncated_loops,
-                )
-            )
+            logger.print("this model type is not available")
+            logger.close()
+            import sys
+            sys.exit(1)
+            # model = GameURM(
+            #     GameURMConfig(
+            #         hidden_dim=hidden_size,
+            #         num_layers=num_layers,
+            #         num_heads=num_heads,
+            #         num_loops=num_loops,
+            #         num_truncated_loops=num_truncated_loops,
+            #     )
+            # )
         else:
             logger.print(f"Unknown model type: {model_type}. Use 'mlp' or 'urm'.")
             logger.close()
@@ -1022,21 +1242,47 @@ def train(
     rtg_m2 = 1.0
     rtg_moment = 0.0
 
+    # actor_model = actor_model.to(device)
+    # critic_model = critic_model.to(device)
     model = model.to(device)
 
     # After creating the model, before training:
     with torch.no_grad():
+        # actor_model.action_head.weight.zero_()
+        # actor_model.action_head.bias.zero_()
+        # critic_model.value_head.weight.zero_()
+        # critic_model.value_head.bias.zero_()
         model.action_head.weight.zero_()
         model.action_head.bias.zero_()
+        model.value_head.weight.zero_()
+        model.value_head.bias.zero_()
 
-    optimizer = AdamW(
-        model.get_param_groups(value_lr=critic_lr, other_lr=learning_rate),
-        betas=(0.9, 0.999), weight_decay=0.01
-    )
-    # critic_optimizer = AdamW(
-    #     model.value_head.parameters(), lr=critic_lr, betas=(0.9, 0.99), weight_decay=0.01
+    # actor_optimizer = AdamW(
+    #     actor_model.parameters(),
+    #     lr=learning_rate,
+    #     betas=(0.9, 0.999), weight_decay=0.01
     # )
+    # critic_optimizer = AdamW(
+    #     critic_model.parameters(), lr=critic_lr, betas=(0.9, 0.999), weight_decay=0.01
+    # )
+    optimizer = AdamW(
+        model.get_param_groups(critic_lr, learning_rate),
+        betas=(0.9, 0.999),
+        weight_decay=0.01,
+    )
 
+    # actor_lr_scheduler = get_scheduler(
+    #     "cosine",
+    #     actor_optimizer,
+    #     num_warmup_steps=warmup_steps,
+    #     num_training_steps=steps,
+    # )
+    # critic_lr_scheduler = get_scheduler(
+    #     "cosine",
+    #     critic_optimizer,
+    #     num_warmup_steps=warmup_steps,
+    #     num_training_steps=steps,
+    # )
     lr_scheduler = get_scheduler(
         "cosine",
         optimizer,
@@ -1049,12 +1295,13 @@ def train(
         test_game = Game2048()
         test_game.reset()
         test_input = test_game.to_model_format().unsqueeze(0).to(device)
-        act_logits, val_logits = model(test_input)
-        probs = torch.softmax(act_logits, dim=1)
-        print(f"Initial logits: {act_logits}")
-        print(f"Initial probs: {probs}")
-        print(f"Initial value: {val_logits}")
-        print(f"Initial entropy: {-(probs * probs.log()).sum().item():.4f}")
+        # act_logits, val_logits = actor_model(test_input)
+        # val_logit = critic_model(test_input)
+        # print(f"Initial action logits: {act_logits}")
+        # print(f"Initial value logit: {val_logit}")
+        action_logits, value_logit = model(test_input)
+        print(f"Initial action logits: {action_logits}")
+        print(f"Initial value logit: {value_logit}")
 
     # train the model
     highest_score = 0
@@ -1076,6 +1323,8 @@ def train(
         return 0
 
     for train_step in tqdm(range(steps), desc=f"Running RL training"):
+        # actor_model.eval()
+        # critic_model.eval()
         model.eval()
 
         # here we compute a single pass
@@ -1100,11 +1349,14 @@ def train(
         else:
             for _ in range(batch_size):
                 rollout_episodes.append(
+                    # play_game_for_episode(actor_model, critic_model, max_steps=max_steps, device=device)
                     play_game_for_episode(model, max_steps=max_steps, device=device)
                 )
+        
+        # rollout_episodes.extend(augment_data_samples(rollout_episodes, upsample_ratio))
 
         # get the updated moments after each batch
-        rollout_episodes, rtg_moment, rtg_m2, rtg_mu = calculate_advantage(
+        rollout_episodes, augmented_steps, rtg_moment, rtg_m2, rtg_mu = calculate_advantage(
             rollout_episodes,
             gamma,
             rtg_moment,
@@ -1122,34 +1374,50 @@ def train(
             rtg_m2=rtg_m2,
             rtg_mu=rtg_mu,
             rtg_step=train_step+1, # 1-indexed for the correct normalization
+            upsample_ratio=upsample_ratio,
         )
+
+        # add augmented steps to episodes
+        rollout_episodes.append({
+            "moves": augmented_steps,
+            "total_points": sum(step["points_earned"] for step in augmented_steps),
+            "total_steps": len(augmented_steps),
+            "augmented": True,
+            "final_state": augmented_steps[-1]["result_state"],
+        })
 
         # Now we update the model's policy using this rollout
         stats = model_optimize_step(
+            # actor_model,
+            # critic_model,
             model,
             rollout_episodes,
+            # actor_optimizer,
+            # critic_optimizer,
             optimizer,
+            # actor_lr_scheduler,
+            # critic_lr_scheduler,
             lr_scheduler,
             entropy_strength,
             critic_strength,
             device,
         )
 
-        # Get highest score from batch
-        highest_score = max(
-            max([episode["total_points"] for episode in rollout_episodes]),
-            highest_score,
-        )
+        # Get highest score from batch and track if we hit a new record
+        non_augmented_episodes = [ep for ep in rollout_episodes if not ep.get("augmented", False)]
+        batch_max_score = max(episode["total_points"] for episode in non_augmented_episodes)
+        new_high_score = batch_max_score > highest_score
+        highest_score = max(batch_max_score, highest_score)
 
         # Calculate average number of steps in batch
-        avg_steps = sum([len(episode["moves"]) for episode in rollout_episodes]) / len(
-            rollout_episodes
+        avg_steps = sum([len(episode["moves"]) for episode in non_augmented_episodes]) / len(
+            non_augmented_episodes
         )
 
         # compute batch tile stats and update EMAs every step
-        max_tiles = [get_max_tile(ep) for ep in rollout_episodes]
-        num_eps = len(rollout_episodes)
-        batch_avg_score = sum(ep["total_points"] for ep in rollout_episodes) / num_eps
+        max_tiles = [get_max_tile(ep) for ep in non_augmented_episodes]
+        num_eps = len(non_augmented_episodes)
+        batch_avg_score = sum(ep["total_points"] for ep in non_augmented_episodes) / num_eps
         batch_pct_512 = sum(1 for t in max_tiles if t >= 512) / num_eps * 100
         batch_pct_1024 = sum(1 for t in max_tiles if t >= 1024) / num_eps * 100
         batch_pct_2048 = sum(1 for t in max_tiles if t >= 2048) / num_eps * 100
@@ -1182,7 +1450,7 @@ def train(
 
         # detailed stdout output only at print_frequency
         if should_print:
-            best_episode = max(rollout_episodes, key=lambda ep: ep["total_points"])
+            best_episode = max(non_augmented_episodes, key=lambda ep: ep["total_points"])
             weights = RewardWeights(
                 points=points_weight,
                 smoothness=smoothness_weight,
@@ -1205,14 +1473,41 @@ def train(
             if viz_dir:
                 export_episode_visualization(viz_dir, train_step, best_episode, weights, gamma)
 
-            logger.print("")
         
+        # always save viz data when we hit a new high score (even if not printing)
+        if new_high_score and viz_dir and not should_print:
+            record_episode = max(non_augmented_episodes, key=lambda ep: ep["total_points"])
+            record_weights = RewardWeights(
+                points=points_weight,
+                smoothness=smoothness_weight,
+                max_tile=max_tile_weight,
+                corner=corner_weight,
+                adjacency=adjacency_weight,
+                chain=chain_weight,
+                monotonicity=monotonicity_weight,
+                emptiness=emptiness_weight,
+                topological=topological_weight,
+            )
+            export_episode_visualization(viz_dir, train_step, record_episode, record_weights, gamma)
+
         if train_step > 0 and eval_freq and train_step % eval_freq == 0:
+            # actor_model.eval()
+            # critic_model.eval()
             model.eval()
             typer.echo(f"[Step {train_step}] Evaluating model on {eval_games} games", color="green")
             eval_episodes = []
-            for _ in tqdm(range(eval_games), desc="evaluating model", total=eval_games):
-                eval_episodes += [play_game_for_episode(model, max_steps=max_steps, device=next(p.device for p in model.parameters()))]
+            for i in tqdm(range(eval_games), desc="evaluating model", total=eval_games):
+                eval_episodes.append(
+                    play_game_for_episode(
+                        # actor_model,
+                        # critic_model,
+                        model,
+                        max_steps=max_steps,
+                        # device=next(p.device for p in actor_model.parameters()),
+                        device=next(p.device for p in model.parameters()),
+                        seed=i,
+                    )
+                )
             
             # Compute evaluation statistics
             eval_scores = [ep["total_points"] for ep in eval_episodes]
@@ -1237,11 +1532,9 @@ def train(
             typer.echo(f"Eval Results - Max: {eval_max_score:.0f}, Avg: {eval_avg_score:.1f}, Median: {eval_median_score:.0f}", color="green")
             typer.echo(f"Tiles Reached - 512: {eval_pct_512:.1f}%, 1024: {eval_pct_1024:.1f}%, 2048: {eval_pct_2048:.1f}%", color="green")
             
+            # actor_model.train()
+            # critic_model.train()
             model.train()
-
-
-            
-
 
     logger.close()
 

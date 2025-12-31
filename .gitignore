@@ -21,3 +21,5 @@ wheels/
 *.egg
 
 wandb
+viz_data_test
+log_test

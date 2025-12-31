@@ -25,6 +25,7 @@ class MLPConfig(BaseModel):
     hidden_dim: int = 64
     num_layers: int = 2
     dropout: float = 0.1
+    decouple_critic: bool = False
 
 
 class GameURMConfig(BaseModel):
@@ -523,6 +524,82 @@ class Game2048:
         return best_chain_score
 
     @staticmethod
+    def mirror_grid(grid: Grid, direction: str) -> Grid:
+        """
+        Return a mirrored copy of the grid.
+        
+        Args:
+            grid: The grid to mirror
+            direction: Either 'horizontal' or 'vertical'
+        
+        Returns:
+            A new grid that is the mirror of the input grid
+        """
+        mirrored = [[0 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
+        
+        if direction == 'horizontal':
+            # Mirror left-right (flip columns)
+            for i in range(GRID_SIZE):
+                for j in range(GRID_SIZE):
+                    mirrored[i][GRID_SIZE - 1 - j] = grid[i][j]
+        elif direction == 'vertical':
+            # Mirror top-bottom (flip rows)
+            for i in range(GRID_SIZE):
+                for j in range(GRID_SIZE):
+                    mirrored[GRID_SIZE - 1 - i][j] = grid[i][j]
+        else:
+            raise ValueError(f"Invalid direction: {direction}. Must be 'horizontal' or 'vertical'")
+        
+        return mirrored
+
+    @staticmethod
+    def rotate_grid(grid: Grid, rotation: str | int) -> Grid:
+        """
+        Rotate the grid clockwise by the specified amount.
+        
+        Args:
+            grid: The grid to rotate
+            rotation: One of:
+                - 'north', 'up', 0: no rotation
+                - 'east', 'right', 90: 90 degrees clockwise
+                - 'south', 'down', 180: 180 degrees
+                - 'west', 'left', 270: 270 degrees clockwise
+        
+        Returns:
+            A new grid rotated by the specified amount
+        """
+        rotation_map = {
+            'north': 0, 'up': 0, 0: 0,
+            'east': 90, 'right': 90, 90: 90,
+            'south': 180, 'down': 180, 180: 180,
+            'west': 270, 'left': 270, 270: 270,
+        }
+        
+        degrees = rotation_map.get(rotation)
+        if degrees is None:
+            raise ValueError(f"Invalid rotation: {rotation}")
+        
+        if degrees == 0:
+            return [row[:] for row in grid]
+        
+        rotated = [[0 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
+        
+        if degrees == 90:
+            for i in range(GRID_SIZE):
+                for j in range(GRID_SIZE):
+                    rotated[j][GRID_SIZE - 1 - i] = grid[i][j]
+        elif degrees == 180:
+            for i in range(GRID_SIZE):
+                for j in range(GRID_SIZE):
+                    rotated[GRID_SIZE - 1 - i][GRID_SIZE - 1 - j] = grid[i][j]
+        elif degrees == 270:
+            for i in range(GRID_SIZE):
+                for j in range(GRID_SIZE):
+                    rotated[GRID_SIZE - 1 - j][i] = grid[i][j]
+        
+        return rotated
+
+    @staticmethod
     def _position_multiplier(row: int, col: int) -> float:
         """
         Returns a multiplier based on position:
@@ -1003,6 +1080,7 @@ class GameMLP(nn.Module):
 
     def __init__(self, config: MLPConfig) -> None:
         super().__init__()
+        self.decouple_critic = config.decouple_critic
 
         # Stem
         self.stem = nn.Sequential(
@@ -1112,7 +1190,10 @@ class GameMLP(nn.Module):
 
         # project to action logits
         action_logits = self.action_head(x)  # (B, NUM_ACTIONS)
-        value_logit = self.value_head(x)
+        
+        # decouple from the compute graph if-needed
+        value_features = x.detach() if self.decouple_critic else x
+        value_logit = self.value_head(value_features)
 
         # now we normalize to logits
         # loss = None
