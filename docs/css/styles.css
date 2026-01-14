@@ -1,0 +1,365 @@
+/* 2048 RL Demo Styles */
+
+:root {
+    --bg-color: #faf8ef;
+    --board-bg: #bbada0;
+    --cell-bg: #cdc1b4;
+    --text-primary: #776e65;
+    --text-light: #f9f6f2;
+    --accent-color: #8f7a66;
+    --button-bg: #8f7a66;
+    --button-hover: #9f8b77;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: 'Clear Sans', 'Helvetica Neue', Arial, sans-serif;
+    background-color: var(--bg-color);
+    color: var(--text-primary);
+    min-height: 100vh;
+}
+
+.container {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+/* Header */
+header {
+    text-align: center;
+    margin-bottom: 20px;
+}
+
+header h1 {
+    font-size: 48px;
+    font-weight: bold;
+    color: var(--text-primary);
+    margin-bottom: 5px;
+}
+
+.subtitle {
+    color: #a09080;
+    font-size: 16px;
+}
+
+/* Mode Selector */
+.mode-selector {
+    display: flex;
+    justify-content: center;
+    gap: 10px;
+    margin-bottom: 20px;
+}
+
+.mode-btn {
+    padding: 12px 24px;
+    font-size: 16px;
+    font-weight: bold;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    background-color: var(--cell-bg);
+    color: var(--text-primary);
+    transition: all 0.2s ease;
+}
+
+.mode-btn:hover {
+    background-color: #bfb1a3;
+}
+
+.mode-btn.active {
+    background-color: var(--button-bg);
+    color: var(--text-light);
+}
+
+/* Main Game Area */
+.game-area {
+    display: flex;
+    gap: 30px;
+    justify-content: center;
+    align-items: flex-start;
+    flex-wrap: wrap;
+}
+
+.game-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+/* Score Display */
+.score-display {
+    display: flex;
+    gap: 15px;
+    margin-bottom: 15px;
+}
+
+.score-box {
+    background-color: var(--board-bg);
+    border-radius: 6px;
+    padding: 10px 25px;
+    text-align: center;
+    min-width: 100px;
+}
+
+.score-label {
+    display: block;
+    font-size: 13px;
+    color: #eee4da;
+    text-transform: uppercase;
+}
+
+.score-value {
+    display: block;
+    font-size: 28px;
+    font-weight: bold;
+    color: white;
+}
+
+/* Game Board */
+.game-board {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    padding: 12px;
+    background-color: var(--board-bg);
+    border-radius: 6px;
+    width: 400px;
+    height: 400px;
+}
+
+.cell {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: var(--cell-bg);
+    border-radius: 4px;
+    font-size: 48px;
+    font-weight: bold;
+    transition: all 0.1s ease;
+}
+
+/* Action Display */
+.action-display {
+    margin-top: 15px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 24px;
+}
+
+.action-label {
+    font-size: 36px;
+    font-weight: bold;
+    color: var(--text-primary);
+    width: 50px;
+    text-align: center;
+}
+
+.points-earned {
+    font-size: 20px;
+    font-weight: bold;
+    color: #4CAF50;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+}
+
+.points-earned.show {
+    opacity: 1;
+}
+
+/* Controls Panel */
+.controls-panel {
+    min-width: 280px;
+}
+
+.controls {
+    background-color: #f0e6d6;
+    border-radius: 8px;
+    padding: 20px;
+}
+
+.controls.hidden {
+    display: none;
+}
+
+.controls h3 {
+    margin-bottom: 15px;
+    color: var(--text-primary);
+    font-size: 18px;
+}
+
+.control-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 15px;
+}
+
+.control-btn {
+    padding: 10px 15px;
+    font-size: 18px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    background-color: var(--button-bg);
+    color: white;
+    transition: background-color 0.2s ease;
+}
+
+.control-btn:hover:not(:disabled) {
+    background-color: var(--button-hover);
+}
+
+.control-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Range Slider */
+input[type="range"] {
+    flex: 1;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--cell-bg);
+    outline: none;
+    -webkit-appearance: none;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--button-bg);
+    cursor: pointer;
+}
+
+.control-row label {
+    font-size: 14px;
+    color: var(--text-primary);
+}
+
+.control-row span {
+    font-size: 12px;
+    color: #a09080;
+    min-width: 50px;
+}
+
+/* Game Info */
+.game-info {
+    margin-top: 15px;
+    padding-top: 15px;
+    border-top: 1px solid #ddd;
+}
+
+.game-info p {
+    font-size: 14px;
+    margin-bottom: 5px;
+}
+
+/* Model Status */
+.model-status {
+    margin-bottom: 15px;
+}
+
+.model-status p {
+    font-size: 14px;
+}
+
+/* Action Probabilities */
+.action-probs {
+    margin-top: 15px;
+    padding-top: 15px;
+    border-top: 1px solid #ddd;
+}
+
+.action-probs h4 {
+    font-size: 14px;
+    margin-bottom: 10px;
+    color: var(--text-primary);
+}
+
+.prob-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    font-size: 13px;
+}
+
+.prob-row span:first-child {
+    width: 70px;
+}
+
+.prob-bar {
+    flex: 1;
+    height: 16px;
+    background-color: #e0d6c6;
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.prob-fill {
+    height: 100%;
+    background-color: #8f7a66;
+    transition: width 0.2s ease;
+    width: 0%;
+}
+
+.prob-row span:last-child {
+    width: 45px;
+    text-align: right;
+    font-size: 12px;
+    color: #a09080;
+}
+
+/* Footer */
+footer {
+    text-align: center;
+    margin-top: 30px;
+    padding-top: 20px;
+    border-top: 1px solid #ddd;
+}
+
+footer a {
+    color: var(--accent-color);
+    text-decoration: none;
+}
+
+footer a:hover {
+    text-decoration: underline;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .game-area {
+        flex-direction: column;
+        align-items: center;
+    }
+
+    .game-board {
+        width: 320px;
+        height: 320px;
+        gap: 8px;
+        padding: 8px;
+    }
+
+    .cell {
+        font-size: 32px;
+    }
+
+    .controls-panel {
+        width: 100%;
+        max-width: 400px;
+    }
+
+    header h1 {
+        font-size: 36px;
+    }
+}

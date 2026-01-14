@@ -29,6 +29,99 @@ from game import Game2048, Direction, GameMLP, MLPConfig, GameURM, GameURMConfig
 from logger import MetricLogger
 
 
+def export_model_to_onnx(model: torch.nn.Module, output_path: str, config: MLPConfig) -> None:
+    """
+    Export a GameMLP model to ONNX format for browser inference.
+
+    The exported model takes a (batch, 48) input tensor and outputs:
+    - action_logits: (batch, 4) - log probabilities for UP/DOWN/LEFT/RIGHT
+    - value: (batch, 1) - estimated value of the state
+    """
+    import onnx
+
+    model.eval()
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Create dummy input matching to_model_format() output
+    dummy_input = torch.randn(1, 48)
+
+    torch.onnx.export(
+        model,
+        dummy_input,
+        str(output_path),
+        input_names=["board_state"],
+        output_names=["action_logits", "value"],
+        dynamo=False,  # Use legacy exporter for simpler models
+    )
+
+    # Load and re-save with weights embedded (not external) for browser compatibility
+    onnx_model = onnx.load(str(output_path))
+    onnx.checker.check_model(onnx_model)
+
+    # Convert external data to embedded tensors
+    from onnx.external_data_helper import convert_model_to_external_data, load_external_data_for_model
+    load_external_data_for_model(onnx_model, str(output_path.parent))
+
+    # Remove the external data file and save with embedded weights
+    external_data_path = output_path.parent / (output_path.name + ".data")
+    if external_data_path.exists():
+        external_data_path.unlink()
+
+    onnx.save(onnx_model, str(output_path))
+
+    # Save config alongside for JS to know architecture
+    config_path = output_path.parent / "model_config.json"
+    with open(config_path, "w") as f:
+        json.dump(config.model_dump(), f, indent=2)
+
+
+def export_best_game_for_demo(episode: "EpisodeData", output_path: str) -> None:
+    """
+    Export the best game episode to JSON format for the demo website replay.
+
+    Converts the internal EpisodeData format to a clean JSON structure
+    suitable for browser visualization.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not episode or not episode.get("moves"):
+        print(f"Warning: No valid episode to export")
+        return
+
+    direction_names = ["UP", "DOWN", "LEFT", "RIGHT"]
+
+    def grid_to_values(grid):
+        """Convert exponent grid to actual tile values."""
+        return [[2**cell if cell > 0 else 0 for cell in row] for row in grid]
+
+    demo_data = {
+        "score": episode["total_points"],
+        "total_steps": episode["total_steps"],
+        "moves": []
+    }
+
+    for i, move in enumerate(episode["moves"]):
+        state_before = move.get("state_before", [])
+        state_after = move.get("result_state", [])
+
+        move_data = {
+            "step": i + 1,
+            "state_before": grid_to_values(state_before) if state_before else [],
+            "action": direction_names[move["selected_direction"]],
+            "state_after": grid_to_values(state_after) if state_after else [],
+            "points_earned": move.get("points_earned", 0),
+            "entropy": move.get("entropy", 0.0),
+        }
+        demo_data["moves"].append(move_data)
+
+    with open(output_path, "w") as f:
+        json.dump(demo_data, f, indent=2)
+
+    print(f"Exported best game ({episode['total_points']} points, {episode['total_steps']} moves) to {output_path}")
+
+
 class StepData(TypedDict, total=False):
     """
     Schema for per-step data collected during gameplay and enriched during advantage calculation.
@@ -1202,6 +1295,16 @@ def train(
         "--upsample-ratio",
         help="Ratio of samples to upsample for data augmentation",
     ),
+    export_demo: bool = typer.Option(
+        False,
+        "--export-demo",
+        help="Export best game and model to docs/ folder for GitHub Pages demo",
+    ),
+    checkpoint_dir: Optional[str] = typer.Option(
+        "checkpoints",
+        "--checkpoint-dir",
+        help="Directory to save model checkpoints",
+    ),
 ):
     """Watch the AI play 2048."""
     device = torch.device("cuda:0" if gpu and torch.cuda.is_available() else "cpu")
@@ -1358,6 +1461,11 @@ def train(
     # train the model
     highest_score = 0
 
+    # Best game/model tracking for demo export
+    best_game_episode: Optional[EpisodeData] = None
+    best_eval_avg_score = 0.0
+    model_config = MLPConfig(hidden_dim=hidden_size, num_layers=num_layers, decouple_critic=decouple_critic)
+
     # EMA trackers for running statistics (decay=0.001 ~ last 1000 steps)
     ema_decay = 0.001
     ema_avg_score = 0.0
@@ -1461,6 +1569,11 @@ def train(
         batch_max_score = max(episode["total_points"] for episode in non_augmented_episodes)
         new_high_score = batch_max_score > highest_score
         highest_score = max(batch_max_score, highest_score)
+
+        # Track best game episode for demo export
+        if new_high_score:
+            best_game_episode = max(non_augmented_episodes, key=lambda ep: ep["total_points"])
+            best_game_episode = deepcopy(best_game_episode)  # Make a copy to preserve state
 
         # Calculate average number of steps in batch
         avg_steps = sum([len(episode["moves"]) for episode in non_augmented_episodes]) / len(non_augmented_episodes)
@@ -1588,9 +1701,42 @@ def train(
                 color="green",
             )
 
+            # Save best model checkpoint when eval average improves
+            if eval_avg_score > best_eval_avg_score:
+                best_eval_avg_score = eval_avg_score
+                checkpoint_path = Path(checkpoint_dir) / "best_model.pt"
+                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save({
+                    "model_state_dict": model.state_dict(),
+                    "config": model_config.model_dump(),
+                    "eval_avg_score": eval_avg_score,
+                    "train_step": train_step,
+                }, checkpoint_path)
+                typer.echo(f"New best model saved (avg score: {eval_avg_score:.1f}) to {checkpoint_path}", color="green")
+
             # actor_model.train()
             # critic_model.train()
             model.train()
+
+    # End of training: export demo if requested
+    if export_demo:
+        typer.echo("\nExporting demo assets to docs/ folder...")
+        docs_data_dir = Path("docs/data")
+        docs_data_dir.mkdir(parents=True, exist_ok=True)
+
+        # Export best game
+        if best_game_episode:
+            export_best_game_for_demo(best_game_episode, str(docs_data_dir / "best_game.json"))
+        else:
+            typer.echo("Warning: No best game to export (no games were played)")
+
+        # Export model to ONNX
+        try:
+            export_model_to_onnx(model, str(docs_data_dir / "model.onnx"), model_config)
+            typer.echo(f"Model exported to {docs_data_dir / 'model.onnx'}")
+        except Exception as e:
+            typer.echo(f"Error exporting model to ONNX: {e}")
+            typer.echo("Make sure 'onnx' package is installed: pip install onnx")
 
     logger.close()
 
@@ -1606,6 +1752,122 @@ def evaluate(
 
     # TODO: Implement evaluation
     typer.echo("Evaluation not yet implemented")
+
+
+@app.command("export-demo")
+def export_demo_cmd(
+    model_path: Path = typer.Option(
+        "checkpoints/best_model.pt",
+        "--model",
+        "-m",
+        help="Path to model checkpoint (.pt file)",
+    ),
+    game_path: Optional[Path] = typer.Option(
+        None,
+        "--game",
+        "-g",
+        help="Path to game JSON file (optional, will play new games if not provided)",
+    ),
+    output_dir: Path = typer.Option(
+        "docs/data",
+        "--output",
+        "-o",
+        help="Output directory for demo assets",
+    ),
+    num_games: int = typer.Option(
+        10,
+        "--num-games",
+        "-n",
+        help="Number of games to play to find best game (if --game not provided)",
+    ),
+):
+    """
+    Export trained model and best game to docs/ for GitHub Pages demo.
+
+    Usage:
+        python train.py export-demo --model checkpoints/best_model.pt
+        python train.py export-demo --model checkpoints/best_model.pt --game viz_data/step_001000.json
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load model from checkpoint
+    if not model_path.exists():
+        typer.echo(f"Error: Model checkpoint not found at {model_path}")
+        raise typer.Exit(1)
+
+    typer.echo(f"Loading model from {model_path}...")
+    checkpoint = torch.load(model_path, map_location="cpu")
+
+    if isinstance(checkpoint, dict) and "config" in checkpoint:
+        config = MLPConfig(**checkpoint["config"])
+        state_dict = checkpoint["model_state_dict"]
+    else:
+        # Assume it's just a state dict, use defaults
+        config = MLPConfig()
+        state_dict = checkpoint
+
+    model = GameMLP(config)
+    model.load_state_dict(state_dict)
+    model.eval()
+    typer.echo(f"Model loaded (hidden_dim={config.hidden_dim}, num_layers={config.num_layers})")
+
+    # Get best game
+    if game_path and game_path.exists():
+        # Load existing game from viz_data format
+        typer.echo(f"Loading game from {game_path}...")
+        with open(game_path) as f:
+            game_data = json.load(f)
+
+        # Convert viz_data format to demo format if needed
+        if "moves" in game_data and game_data["moves"]:
+            demo_data = {
+                "score": game_data.get("score", 0),
+                "total_steps": game_data.get("total_steps", len(game_data["moves"])),
+                "moves": game_data["moves"]
+            }
+            output_game_path = output_dir / "best_game.json"
+            with open(output_game_path, "w") as f:
+                json.dump(demo_data, f, indent=2)
+            typer.echo(f"Game exported to {output_game_path}")
+    else:
+        # Play games to find best one
+        typer.echo(f"Playing {num_games} games to find best game...")
+        best_episode = None
+        best_score = 0
+
+        for i in tqdm(range(num_games), desc="Playing games"):
+            episode = play_game_for_episode(model, max_steps=None, device=None)
+            if episode["total_points"] > best_score:
+                best_score = episode["total_points"]
+                best_episode = episode
+
+        if best_episode:
+            export_best_game_for_demo(best_episode, str(output_dir / "best_game.json"))
+        else:
+            typer.echo("Warning: No games were played successfully")
+
+    # Export model to ONNX
+    try:
+        onnx_path = output_dir / "model.onnx"
+        export_model_to_onnx(model, str(onnx_path), config)
+        typer.echo(f"Model exported to {onnx_path}")
+    except ImportError as e:
+        typer.echo(f"Error: Missing dependency - {e}")
+        typer.echo("Install with: pip install onnx onnxscript")
+        raise typer.Exit(1)
+    except Exception as e:
+        typer.echo(f"Error exporting model: {e}")
+        raise typer.Exit(1)
+
+    # Also save PyTorch checkpoint to docs for version control
+    import shutil
+    pt_dest = output_dir / "best_model.pt"
+    shutil.copy(model_path, pt_dest)
+    typer.echo(f"PyTorch checkpoint copied to {pt_dest}")
+
+    typer.echo(f"\nDemo assets exported to {output_dir}/")
+    typer.echo("To test locally: cd docs && python -m http.server 8000")
 
 
 def get_keypress():

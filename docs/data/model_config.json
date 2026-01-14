@@ -1,0 +1,6 @@
+{
+  "hidden_dim": 196,
+  "num_layers": 2,
+  "dropout": 0.1,
+  "decouple_critic": false
+}
