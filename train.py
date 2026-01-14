@@ -21,7 +21,7 @@ import multiprocessing
 import torch
 import typer
 from torch.nn import functional as F
-from torch.optim import AdamW
+from torch.optim import AdamW, Muon
 from tqdm import tqdm
 
 
@@ -61,6 +61,7 @@ def export_model_to_onnx(model: torch.nn.Module, output_path: str, config: MLPCo
 
     # Convert external data to embedded tensors
     from onnx.external_data_helper import convert_model_to_external_data, load_external_data_for_model
+
     load_external_data_for_model(onnx_model, str(output_path.parent))
 
     # Remove the external data file and save with embedded weights
@@ -96,11 +97,7 @@ def export_best_game_for_demo(episode: "EpisodeData", output_path: str) -> None:
         """Convert exponent grid to actual tile values."""
         return [[2**cell if cell > 0 else 0 for cell in row] for row in grid]
 
-    demo_data = {
-        "score": episode["total_points"],
-        "total_steps": episode["total_steps"],
-        "moves": []
-    }
+    demo_data = {"score": episode["total_points"], "total_steps": episode["total_steps"], "moves": []}
 
     for i, move in enumerate(episode["moves"]):
         state_before = move.get("state_before", [])
@@ -418,7 +415,7 @@ def model_optimize_step(
     optimizer: torch.optim.Optimizer,
     # actor_lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
     # critic_lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
-    lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
+    lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
     beta: float = 0.1,
     critic_strength: float = 1.0,
     device: torch.device = None,
@@ -465,6 +462,10 @@ def model_optimize_step(
             action_mask = action_mask.to(device)
             advantage = advantage.to(device)
             old_policy_logprobs = old_policy_logprobs.to(device)
+
+        # with torch.no_grad():
+        #     # normalize advantage for more stability during training
+        #     advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
         # now that the data is prepared, we compute the loss and take an optimizer step
         # actor_model.train()
@@ -597,7 +598,7 @@ def model_optimize_step(
         num_batches += 1
 
     # collect averaged stats for logging
-    lr_scheduler.step()
+    optimizer.scheduler_step()
     stats = {
         "loss": total_loss / num_batches,
         "policy_loss": total_policy_loss / num_batches,
@@ -714,9 +715,7 @@ def calculate_advantage(
     rtg_batch_var = 0.0 if N <= 1 else sum((fr - rtg_batch_mean) ** 2 for fr in future_rewards_raw) / N
 
     # rtg_updated_first_moment = rtg_beta * rtg_first_moment + (1 - rtg_beta) * rtg_batch_mean
-    # rtg_updated_m2 = rtg_beta * rtg_m2 + (1 - rtg_beta) * (
-    #     rtg_batch_var + rtg_batch_mean**2
-    # )  # this estimates E[G^2]
+    # rtg_updated_m2 = rtg_beta * rtg_m2 + (1 - rtg_beta) * (rtg_batch_var + rtg_batch_mean**2)  # this estimates E[G^2]
     # rtg_updated_mu = rtg_beta * rtg_mu + (1 - rtg_beta) * rtg_batch_mean  # this estimates E[G]
 
     # calculate bias-corrected moments
@@ -848,7 +847,7 @@ def calculate_advantage(
     # adv_std = adv_var**0.5
     # for ep in episodes:
     #     for m in ep["moves"]:
-    # m["advantage"] = (m["advantage"] - adv_mean) / (adv_std + eps)
+    #         m["advantage"] = (m["advantage"] - adv_mean) / (adv_std + eps)
 
     # finally, we compute updated rtg moments using the batch statistics
     # We wait until the end to do this so that the loss between the current value head and
@@ -1163,6 +1162,78 @@ def export_episode_visualization(
         json.dump(viz_data, f, indent=2)
 
 
+# class MultiOptimizer:
+#     def __init__(self, *optimizers):
+#         self.optimizers = optimizers
+
+#     def step(self):
+#         for opt in self.optimizers:
+#             opt.step()
+
+#     def zero_grad(self):
+#         for opt in self.optimizers:
+#             opt.zero_grad()
+
+#     def state_dict(self):
+#         return [opt.state_dict() for opt in self.optimizers]
+
+#     def load_state_dict(self, state_dicts):
+#         for opt, sd in zip(self.optimizers, state_dicts):
+#             opt.load_state_dict(sd)
+
+
+class MultiOptimizer:
+    """Wraps multiple optimizers and their schedulers into a single interface."""
+
+    def __init__(self, *optimizer_scheduler_pairs):
+        """
+        Args:
+            *optimizer_scheduler_pairs: Tuples of (optimizer, scheduler) or just optimizer.
+                If scheduler is None or not provided, no scheduler step is taken for that optimizer.
+        """
+        self.optimizers = []
+        self.schedulers = []
+
+        for item in optimizer_scheduler_pairs:
+            if isinstance(item, tuple):
+                opt, sched = item
+            else:
+                opt, sched = item, None
+            self.optimizers.append(opt)
+            self.schedulers.append(sched)
+
+    def step(self):
+        for opt in self.optimizers:
+            opt.step()
+
+    def zero_grad(self):
+        for opt in self.optimizers:
+            opt.zero_grad()
+
+    def scheduler_step(self, *args, **kwargs):
+        """Step all schedulers. Pass metrics here if using ReduceLROnPlateau."""
+        for sched in self.schedulers:
+            if sched is not None:
+                sched.step(*args, **kwargs)
+
+    def get_lr(self):
+        """Returns list of current learning rates for each optimizer."""
+        return [opt.param_groups[0]["lr"] for opt in self.optimizers]
+
+    def state_dict(self):
+        return {
+            "optimizers": [opt.state_dict() for opt in self.optimizers],
+            "schedulers": [s.state_dict() if s else None for s in self.schedulers],
+        }
+
+    def load_state_dict(self, state_dict):
+        for opt, sd in zip(self.optimizers, state_dict["optimizers"]):
+            opt.load_state_dict(sd)
+        for sched, sd in zip(self.schedulers, state_dict["schedulers"]):
+            if sched and sd:
+                sched.load_state_dict(sd)
+
+
 @app.command()
 def train(
     steps: int = typer.Option(1000, "--steps", "-s", help="Number of training steps"),
@@ -1420,12 +1491,42 @@ def train(
     # critic_optimizer = AdamW(
     #     critic_model.parameters(), lr=critic_lr, betas=(0.9, 0.999), weight_decay=0.01
     # )
-    optimizer = AdamW(
-        model.get_param_groups(critic_lr, learning_rate),
+    #         return [
+    #         {"params": other_params_2d, "lr": other_lr},
+    #         {"params": other_params_1d, "lr": other_lr},
+    #         {"params": value_params_2d, "lr": value_lr},
+    #         {"params": value_params_1d, "lr": value_lr},
+    #     ]
+    # value_params_1d = []
+    # value_params_2d = []
+    # other_params_1d = []
+    # other_params_2d = []
+    other_params_2d, other_params_1d, value_params_2d, value_params_1d = model.get_param_groups(
+        critic_lr, learning_rate
+    )
+
+    adamw = AdamW(
+        [other_params_1d, value_params_1d],
         betas=(0.9, 0.999),
         weight_decay=0.01,
     )
 
+    muon = Muon([other_params_2d, value_params_2d], adjust_lr_fn="match_rms_adamw", weight_decay=0.01)
+    adamw_scheduler = get_scheduler(
+        "cosine",
+        adamw,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=steps,
+    )
+
+    muon_scheduler = get_scheduler(
+        "cosine",
+        muon,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=steps,
+    )
+
+    optimizer = MultiOptimizer((muon, muon_scheduler), (adamw, adamw_scheduler))
     # actor_lr_scheduler = get_scheduler(
     #     "cosine",
     #     actor_optimizer,
@@ -1438,12 +1539,6 @@ def train(
     #     num_warmup_steps=warmup_steps,
     #     num_training_steps=steps,
     # )
-    lr_scheduler = get_scheduler(
-        "cosine",
-        optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=steps,
-    )
 
     # Add this before the training loop starts
     with torch.no_grad():
@@ -1557,7 +1652,7 @@ def train(
             optimizer,
             # actor_lr_scheduler,
             # critic_lr_scheduler,
-            lr_scheduler,
+            None,
             entropy_strength,
             critic_strength,
             device,
@@ -1706,13 +1801,18 @@ def train(
                 best_eval_avg_score = eval_avg_score
                 checkpoint_path = Path(checkpoint_dir) / "best_model.pt"
                 checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save({
-                    "model_state_dict": model.state_dict(),
-                    "config": model_config.model_dump(),
-                    "eval_avg_score": eval_avg_score,
-                    "train_step": train_step,
-                }, checkpoint_path)
-                typer.echo(f"New best model saved (avg score: {eval_avg_score:.1f}) to {checkpoint_path}", color="green")
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "config": model_config.model_dump(),
+                        "eval_avg_score": eval_avg_score,
+                        "train_step": train_step,
+                    },
+                    checkpoint_path,
+                )
+                typer.echo(
+                    f"New best model saved (avg score: {eval_avg_score:.1f}) to {checkpoint_path}", color="green"
+                )
 
             # actor_model.train()
             # critic_model.train()
@@ -1824,7 +1924,7 @@ def export_demo_cmd(
             demo_data = {
                 "score": game_data.get("score", 0),
                 "total_steps": game_data.get("total_steps", len(game_data["moves"])),
-                "moves": game_data["moves"]
+                "moves": game_data["moves"],
             }
             output_game_path = output_dir / "best_game.json"
             with open(output_game_path, "w") as f:
@@ -1862,6 +1962,7 @@ def export_demo_cmd(
 
     # Also save PyTorch checkpoint to docs for version control
     import shutil
+
     pt_dest = output_dir / "best_model.pt"
     shutil.copy(model_path, pt_dest)
     typer.echo(f"PyTorch checkpoint copied to {pt_dest}")

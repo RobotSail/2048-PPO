@@ -66,9 +66,7 @@ class Game2048:
     @classmethod
     def from_tensor(cls, state: torch.Tensor) -> "Game2048":
         if state.ndim != GRID_SIZE**2:
-            raise ValueError(
-                f"received inappropriate dimensions for creating a new grid"
-            )
+            raise ValueError(f"received inappropriate dimensions for creating a new grid")
 
         if state.shape != (GRID_SIZE, GRID_SIZE):
             raise ValueError(f"dimensions are inappropriate for a grid")
@@ -109,16 +107,16 @@ class Game2048:
     def state_has_next_step(state: Grid) -> bool:
         # it has a next step when it can move left, right, up, or down
         for direction in Direction._member_map_.values():
-            if Game2048.can_move_in_direction(
+            if Game2048.can_move_in_direction(state=state, direction=direction) or Game2048.can_merge_in_direction(
                 state=state, direction=direction
-            ) or Game2048.can_merge_in_direction(state=state, direction=direction):
+            ):
                 return True
         return False
 
     def direction_has_step(self, direction: Direction) -> bool:
-        return Game2048.can_move_in_direction(
+        return Game2048.can_move_in_direction(self.grid, direction) or Game2048.can_merge_in_direction(
             self.grid, direction
-        ) or Game2048.can_merge_in_direction(self.grid, direction)
+        )
 
     @staticmethod
     def simulate_move(grid: Grid, direction: Direction) -> tuple[Grid, int, int]:
@@ -133,9 +131,7 @@ class Game2048:
         # Determine if we need to transpose and which merge function to use
         if direction in (Direction.UP, Direction.DOWN):
             # Transpose: work with columns as rows
-            working_grid = [
-                [new_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)
-            ]
+            working_grid = [[new_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)]
             merge_fn = (
                 Game2048._merge_and_shift_left_with_score
                 if direction == Direction.UP
@@ -144,9 +140,7 @@ class Game2048:
             results = [merge_fn(row) for row in working_grid]
             working_grid = [r[0] for r in results]
             # Transpose back
-            new_grid = [
-                [working_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)
-            ]
+            new_grid = [[working_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)]
         else:  # LEFT or RIGHT
             merge_fn = (
                 Game2048._merge_and_shift_left_with_score
@@ -203,24 +197,16 @@ class Game2048:
         # Transform the grid based on direction
         if direction == Direction.UP:
             # Transpose to work with columns as rows
-            working_grid = [
-                [new_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)
-            ]
+            working_grid = [[new_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)]
             working_grid = [self._merge_and_shift_left(row) for row in working_grid]
             # Transpose back
-            new_grid = [
-                [working_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)
-            ]
+            new_grid = [[working_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)]
         elif direction == Direction.DOWN:
             # Transpose to work with columns as rows
-            working_grid = [
-                [new_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)
-            ]
+            working_grid = [[new_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)]
             working_grid = [self._merge_and_shift_right(row) for row in working_grid]
             # Transpose back
-            new_grid = [
-                [working_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)
-            ]
+            new_grid = [[working_grid[j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)]
         elif direction == Direction.LEFT:
             new_grid = [self._merge_and_shift_left(row) for row in new_grid]
         elif direction == Direction.RIGHT:
@@ -267,9 +253,7 @@ class Game2048:
     def _merge_and_shift_right_with_score(row: list[int]) -> tuple[list[int], int, int]:
         """Merge and shift a row to the right, returning (new_row, score_gained, max_tile_created)."""
         reversed_row = row[::-1]
-        merged, score, max_tile = Game2048._merge_and_shift_left_with_score(
-            reversed_row
-        )
+        merged, score, max_tile = Game2048._merge_and_shift_left_with_score(reversed_row)
         return merged[::-1], score, max_tile
 
     @staticmethod
@@ -312,9 +296,7 @@ class Game2048:
         """
         Returns the list of valid directions we can take a move in under the current state.
         """
-        return [
-            d for d in Direction._member_map_.values() if self.direction_has_step(d)
-        ]
+        return [d for d in Direction._member_map_.values() if self.direction_has_step(d)]
 
     @staticmethod
     def can_merge_in_direction(state: Grid, direction: Direction) -> bool:
@@ -527,36 +509,36 @@ class Game2048:
     def mirror_grid(grid: Grid, direction: str) -> Grid:
         """
         Return a mirrored copy of the grid.
-        
+
         Args:
             grid: The grid to mirror
             direction: Either 'horizontal' or 'vertical'
-        
+
         Returns:
             A new grid that is the mirror of the input grid
         """
         mirrored = [[0 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
-        
-        if direction == 'horizontal':
+
+        if direction == "horizontal":
             # Mirror left-right (flip columns)
             for i in range(GRID_SIZE):
                 for j in range(GRID_SIZE):
                     mirrored[i][GRID_SIZE - 1 - j] = grid[i][j]
-        elif direction == 'vertical':
+        elif direction == "vertical":
             # Mirror top-bottom (flip rows)
             for i in range(GRID_SIZE):
                 for j in range(GRID_SIZE):
                     mirrored[GRID_SIZE - 1 - i][j] = grid[i][j]
         else:
             raise ValueError(f"Invalid direction: {direction}. Must be 'horizontal' or 'vertical'")
-        
+
         return mirrored
 
     @staticmethod
     def rotate_grid(grid: Grid, rotation: str | int) -> Grid:
         """
         Rotate the grid clockwise by the specified amount.
-        
+
         Args:
             grid: The grid to rotate
             rotation: One of:
@@ -564,26 +546,34 @@ class Game2048:
                 - 'east', 'right', 90: 90 degrees clockwise
                 - 'south', 'down', 180: 180 degrees
                 - 'west', 'left', 270: 270 degrees clockwise
-        
+
         Returns:
             A new grid rotated by the specified amount
         """
         rotation_map = {
-            'north': 0, 'up': 0, 0: 0,
-            'east': 90, 'right': 90, 90: 90,
-            'south': 180, 'down': 180, 180: 180,
-            'west': 270, 'left': 270, 270: 270,
+            "north": 0,
+            "up": 0,
+            0: 0,
+            "east": 90,
+            "right": 90,
+            90: 90,
+            "south": 180,
+            "down": 180,
+            180: 180,
+            "west": 270,
+            "left": 270,
+            270: 270,
         }
-        
+
         degrees = rotation_map.get(rotation)
         if degrees is None:
             raise ValueError(f"Invalid rotation: {rotation}")
-        
+
         if degrees == 0:
             return [row[:] for row in grid]
-        
+
         rotated = [[0 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
-        
+
         if degrees == 90:
             for i in range(GRID_SIZE):
                 for j in range(GRID_SIZE):
@@ -596,7 +586,7 @@ class Game2048:
             for i in range(GRID_SIZE):
                 for j in range(GRID_SIZE):
                     rotated[GRID_SIZE - 1 - j][i] = grid[i][j]
-        
+
         return rotated
 
     @staticmethod
@@ -740,10 +730,7 @@ class Game2048:
                 best = current
 
             # Rotate the board 90 degrees clockwise for next iteration
-            current_grid = [
-                [current_grid[GRID_SIZE - 1 - j][i] for j in range(GRID_SIZE)]
-                for i in range(GRID_SIZE)
-            ]
+            current_grid = [[current_grid[GRID_SIZE - 1 - j][i] for j in range(GRID_SIZE)] for i in range(GRID_SIZE)]
 
         # if require_corner_max:
         max_val = max(max(row) for row in grid)
@@ -766,7 +753,7 @@ class Game2048:
                 break
 
         if max_pos in corners:
-            best *= 2 # corner bonus
+            best *= 2  # corner bonus
         else:
             best = best // 2
 
@@ -813,9 +800,7 @@ class Game2048:
         return best
 
     @staticmethod
-    def topological_score(
-        grid: Grid, anchor_corner: tuple[int, int] | None = None
-    ) -> float:
+    def topological_score(grid: Grid, anchor_corner: tuple[int, int] | None = None) -> float:
         """
         Calculate a gradient-based topological score.
 
@@ -1003,9 +988,7 @@ class Game2048:
         emptiness_before = Game2048.emptiness(self.grid)
         max_exp_before = max(max(row) for row in self.grid)
 
-        new_grid, points_earned, max_tile_created = Game2048.simulate_move(
-            self.grid, direction
-        )
+        new_grid, points_earned, max_tile_created = Game2048.simulate_move(self.grid, direction)
         self.grid = new_grid
 
         # compute heuristics after move but before random spawn (to avoid reward hacking)
@@ -1084,29 +1067,20 @@ class GameMLP(nn.Module):
 
         # Stem
         self.stem = nn.Sequential(
-            nn.Linear(
-                in_features=self.N * 3, out_features=config.hidden_dim, bias=False
-            ),
+            nn.Linear(in_features=self.N * 3, out_features=config.hidden_dim, bias=False),
             nn.LayerNorm(config.hidden_dim),
             nn.ReLU(),
         )
 
         # stack of residual blocks
         self.backbone = nn.ModuleList(
-            [
-                ResidualBlock(config.hidden_dim, config.dropout)
-                for _ in range(config.num_layers)
-            ]
+            [ResidualBlock(config.hidden_dim, config.dropout) for _ in range(config.num_layers)]
         )
 
         # action head
-        self.action_head = nn.Linear(
-            in_features=config.hidden_dim, out_features=self.NUM_ACTIONS, bias=True
-        )
+        self.action_head = nn.Linear(in_features=config.hidden_dim, out_features=self.NUM_ACTIONS, bias=True)
         # value head
-        self.value_head = nn.Linear(
-            in_features=config.hidden_dim, out_features=1, bias=True
-        )
+        self.value_head = nn.Linear(in_features=config.hidden_dim, out_features=1, bias=True)
 
         self.apply(GameMLP.init_kaiming)
 
@@ -1116,23 +1090,58 @@ class GameMLP(nn.Module):
         These are the directions that the MLP outputs represent
         """
         return [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT]
-
     def get_param_groups(self, value_lr: float, other_lr: float) -> list[dict]:
         """
         Returns parameter groups with separate learning rates for value head vs everything else.
+        Each group is further split into 1D (biases, norms) and 2D (weight matrices) parameters.
+        
+        Returns a list of 4 parameter groups:
+        - other_params_2d: 2D parameters (not value head) - for Muon
+        - other_params_1d: 1D parameters (not value head) - for AdamW
+        - value_params_2d: 2D parameters (value head) - for Muon
+        - value_params_1d: 1D parameters (value head) - for AdamW
         """
-        value_params = list(self.value_head.parameters())
-        other_params = []
+        value_params_1d = []
+        value_params_2d = []
+        other_params_1d = []
+        other_params_2d = []
 
         for name, module in self.named_children():
-            if name != 'value_head':
-                other_params.extend(module.parameters())
+            for param in module.parameters():
+                if name == "value_head":
+                    if param.ndim == 1:
+                        value_params_1d.append(param)
+                    elif param.ndim >= 2:
+                        value_params_2d.append(param)
+                else:
+                    if param.ndim == 1:
+                        other_params_1d.append(param)
+                    elif param.ndim >= 2:
+                        other_params_2d.append(param)
 
         return [
-            {'params': other_params, 'lr': other_lr},
-            {'params': value_params, 'lr': value_lr},
+            {"params": other_params_2d, "lr": other_lr},
+            {"params": other_params_1d, "lr": other_lr},
+            {"params": value_params_2d, "lr": value_lr},
+            {"params": value_params_1d, "lr": value_lr},
         ]
-    
+
+    def get_1d_and_2d_params(self) -> tuple[list, list]:
+        """
+        Separates parameters into 1D (biases, norms) and 2D (weight matrices).
+        Useful for applying different optimization strategies (e.g., Muon for 2D, AdamW for 1D).
+        """
+        params_1d = []
+        params_2d = []
+
+        for param in self.parameters():
+            if param.ndim == 1:
+                params_1d.append(param)
+            elif param.ndim >= 2:
+                params_2d.append(param)
+
+        return params_1d, params_2d
+
     def forward(
         self,
         inputs: torch.Tensor,
@@ -1153,9 +1162,7 @@ class GameMLP(nn.Module):
         B = 1
 
         if inputs.ndim <= 1:
-            raise ValueError(
-                f"input must consist of shape (batch, channel), got: {inputs.shape}"
-            )
+            raise ValueError(f"input must consist of shape (batch, channel), got: {inputs.shape}")
 
         # handles single-length vector inputs
         C = inputs.shape[-1]
@@ -1190,7 +1197,7 @@ class GameMLP(nn.Module):
 
         # project to action logits
         action_logits = self.action_head(x)  # (B, NUM_ACTIONS)
-        
+
         # decouple from the compute graph if-needed
         value_features = x.detach() if self.decouple_critic else x
         value_logit = self.value_head(value_features)
@@ -1373,9 +1380,7 @@ class GameURM(nn.Module):
         )
 
         # Stack of URM transformer blocks (reused in recurrent loops)
-        self.layers = nn.ModuleList(
-            [GameURMBlock(config) for _ in range(config.num_layers)]
-        )
+        self.layers = nn.ModuleList([GameURMBlock(config) for _ in range(config.num_layers)])
 
         # Learnable initial hidden state for recurrent loops
         self.init_hidden = nn.Parameter(torch.zeros(1, self.N, config.hidden_dim))
@@ -1481,9 +1486,7 @@ if __name__ == "__main__":
     print(f"Action logits:\n{logits}")
 
     print("\n=== Testing GameURM ===")
-    urm_model = GameURM(
-        GameURMConfig(hidden_dim=64, num_loops=4, num_truncated_loops=1)
-    )
+    urm_model = GameURM(GameURMConfig(hidden_dim=64, num_loops=4, num_truncated_loops=1))
     urm_logits, urm_value = urm_model(stacked)
     print(f"Action logits shape: {urm_logits.shape}")
     print(f"Value shape: {urm_value.shape}")
