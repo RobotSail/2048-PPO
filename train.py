@@ -2,6 +2,7 @@
 CLI training interface for 2048 AI agent.
 Run with: python train.py [command]
 """
+
 from copy import deepcopy
 
 import json
@@ -13,13 +14,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NotRequired, Optional, TypedDict
 from tqdm import tqdm
+from torch.utils.data import DataLoader, RandomSampler, Dataset
 
 from transformers import get_scheduler
 import multiprocessing
 import torch
 import typer
 from torch.nn import functional as F
-from torch.optim import AdamW 
+from torch.optim import AdamW
 from tqdm import tqdm
 
 
@@ -30,27 +32,29 @@ from logger import MetricLogger
 class StepData(TypedDict, total=False):
     """
     Schema for per-step data collected during gameplay and enriched during advantage calculation.
-    
+
     Fields are grouped by when they're populated:
     - Gameplay fields: set in play_game_for_episode()
     - Advantage fields: set in calculate_advantage()
-    
+
     Using total=False allows incremental construction while still providing type hints.
     """
+
     # gameplay: model predictions
     predicted_future_value: float
     selected_direction: int  # index into Direction enum (0=UP, 1=DOWN, 2=LEFT, 3=RIGHT)
     game_state: torch.Tensor  # flattened model input (48,)
     action_mask: list[bool]  # True = invalid action
     entropy: float  # action distribution entropy
-    
+    policy_logprobs: list[float]
+
     # gameplay: game state
     state_before: Grid  # raw grid before move
     result_state: Grid  # raw grid after move
     points_earned: int  # points from this move
     max_points_possible: int  # best possible points this turn
     points_possible: dict[Direction, int]  # points per direction
-    
+
     # gameplay: heuristic deltas
     smoothness_delta: float
     max_tile_created: int  # exponent of highest tile created this move
@@ -65,7 +69,7 @@ class StepData(TypedDict, total=False):
     emptiness_after: float
     topological_delta: float
     topological_anchor: tuple[int, int] | None  # not used
-    
+
     # advantage calculation: set in calculate_advantage()
     reward: float  # immediate reward (absolute + shaped)
     future_reward_raw: float  # discounted return-to-go (unnormalized)
@@ -75,6 +79,7 @@ class StepData(TypedDict, total=False):
 
 class EpisodeData(TypedDict):
     """Schema for a complete episode/rollout."""
+
     moves: list[StepData]
     total_points: int
     total_steps: int
@@ -125,12 +130,12 @@ def play_game_for_episode(
 ) -> EpisodeData:
     """
     Given a model, play an episode of a game.
-    
+
     If seed is provided, the game will be deterministic (useful for evaluation).
     """
     if seed is not None:
         random.seed(seed)
-    
+
     game = Game2048()
     game.reset()
 
@@ -141,9 +146,7 @@ def play_game_for_episode(
     # this will be a running average
     step = 0
 
-    while game.has_next_step() and (
-        not max_steps or (max_steps > 0 and step < max_steps)
-    ):
+    while game.has_next_step() and (not max_steps or (max_steps > 0 and step < max_steps)):
         step_data: StepData = {}
 
         # find valid directions
@@ -153,9 +156,7 @@ def play_game_for_episode(
 
         # we look at the possible gains to determine the overall reward
         possible_gains = game.preview_move_rewards()
-        best_direction, highest_points = max(
-            possible_gains.items(), key=lambda item: item[1]
-        )
+        best_direction, highest_points = max(possible_gains.items(), key=lambda item: item[1])
 
         # capture grid state before the move (for visualization)
         state_before = [row[:] for row in game.grid]
@@ -167,6 +168,8 @@ def play_game_for_episode(
         # action_logits, _ = actor_model(model_input.unsqueeze(0))
         # _, predicted_future_value = critic_model(model_input.unsqueeze(0))
         action_logits, predicted_future_value = model(model_input.unsqueeze(0))
+        action_logits = action_logits.squeeze(0)
+        predicted_future_value = predicted_future_value.squeeze(0)
 
         # we interret the directions as being UP/DOWN/LEFT/RIGHT:
         dirs = [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT]
@@ -174,17 +177,12 @@ def play_game_for_episode(
         invalid_mask = [_dir not in valid_dirs for _dir in dirs]
 
         # extract the action sequence & mask out invalid states
-        action_probs = action_logits[-1]
-        action_probs[invalid_mask] = -torch.inf
+        action_logits[invalid_mask] = -torch.inf
 
         # now we let the model decide which direction it should move into
-        adjusted_action_dist = torch.softmax(
-            action_probs, dim=0
-        )  # this is the one we want to save
+        adjusted_action_dist = torch.softmax(action_logits, dim=-1)  # this is the one we want to save
         try:
-            selected_action = torch.multinomial(
-                adjusted_action_dist, num_samples=1
-            ).item()
+            selected_action = torch.multinomial(adjusted_action_dist, num_samples=1).item()
         except RuntimeError:
             from IPython import embed
 
@@ -229,6 +227,8 @@ def play_game_for_episode(
         step_data["topological_delta"] = info.get("topological_delta", 0.0)
         step_data["entropy"] = step_entropy
 
+        step_data["policy_logprobs"] = (action_logits.log_softmax(dim=-1)).tolist()
+
         # save the data generated at the current step
         game_data.append(step_data)
 
@@ -262,6 +262,59 @@ def _worker_play_game(args: tuple) -> EpisodeData:
     return play_game_for_episode(model, max_steps=max_steps, device=None)
 
 
+class MyDataset(Dataset):
+    def __init__(self, episodes: list[EpisodeData]):
+        self.moves = []
+
+        for ep in episodes:
+            self.moves.extend(ep["moves"])
+
+        # now we create a single batched input tensor
+
+    def __len__(self):
+        return len(self.moves)
+
+    def __getitem__(self, idx: int):
+        move = self.moves[idx]
+
+        return {
+            "game_state": move["game_state"],
+            "direction_idx": move["selected_direction"],
+            "action_mask": move["action_mask"],
+            "advantage": move["advantage"],
+            "future_reward": move["future_reward"],
+            "policy_logprobs": move["policy_logprobs"],
+        }
+
+
+def collate_fn(minibatch: list[dict]):
+    # input list of these objects
+    #     "game_state": move["game_state"],
+    #     "direction_idx": move["selected_direction"],
+    #     "action_mask": move["action_mask"],
+    #     "advantage": move["advantage"],
+    #     "future_reward": move["future_reward"],
+    #     "policy_logprobs": move["policy_logprobs"],
+    # }
+
+    input_batch = torch.stack([item["game_state"] for item in minibatch])
+    target_batch = torch.tensor([item["direction_idx"] for item in minibatch])  # (B,)
+    action_mask = torch.tensor([item["action_mask"] for item in minibatch])
+    advantage = torch.tensor([item["advantage"] for item in minibatch], dtype=torch.float32)
+    future_reward = torch.tensor([item["future_reward"] for item in minibatch])
+    old_logprobs = torch.tensor([item["policy_logprobs"] for item in minibatch])
+    # old_logprobs = old_policy_logprobs.squeeze(1)
+
+    return {
+        "input_batch": input_batch,
+        "target_batch": target_batch,
+        "action_mask": action_mask,
+        "advantage": advantage,
+        "future_reward": future_reward,
+        "old_logprobs": old_logprobs,
+    }
+
+
 def model_optimize_step(
     # actor_model: torch.nn.Module,
     # critic_model: torch.nn.Module,
@@ -276,6 +329,7 @@ def model_optimize_step(
     beta: float = 0.1,
     critic_strength: float = 1.0,
     device: torch.device = None,
+    batch_size: int = 32,
 ):
     """
     Performs an optimization step as part of the RL loop.
@@ -284,136 +338,185 @@ def model_optimize_step(
     # by the advantage
     # so our input data should become [game state] -> [direction label]
     # batches = []
-    minibatch = []
-    for ep in episodes:
-        for move in ep["moves"]:
-            direction_idx = torch.tensor([move["selected_direction"]])
-            minibatch.append(
-                (
-                    move["game_state"],
-                    direction_idx,
-                    move["action_mask"],
-                    move["advantage"],
-                    move["future_reward"],
-                )
-            )
-
-    # now we create a single batched input tensor
-    input_batch = torch.stack([item[0] for item in minibatch])
-    target_batch = torch.stack([item[1] for item in minibatch])
-    action_mask = torch.tensor([item[2] for item in minibatch])
-    advantage = torch.tensor([item[3] for item in minibatch], dtype=torch.float32)
-    rtg_batch = torch.tensor([item[4] for item in minibatch])
-
-    if device is not None:
-        input_batch = input_batch.to(device)
-        target_batch = target_batch.to(device)
-        action_mask = action_mask.to(device)
-        advantage = advantage.to(device)
-
-    # now that the data is prepared, we compute the loss and take an optimizer step
-    # actor_model.train()
-    # critic_model.train()
-    model.train()
-
-    # action_logits, _ = actor_model(
-    #     inputs=input_batch,
-    # )
-    # _, value_logits = critic_model(
-    #     inputs=input_batch,
-    # )
-    action_logits, value_logits = model(input_batch)
-
-    targets = target_batch.to(device=action_logits.device)
-
-    # convert (B, T) into (B x T)
-    targets = targets.view(-1)
-    masked_action_logits = torch.masked_fill(action_logits, action_mask, float('-inf'))
-
-    # compute the advantaged cross-entropy loss
-    policy_loss_per_sample = F.cross_entropy(
-        input=masked_action_logits, target=targets, reduction="none"
+    dataset = MyDataset(episodes)
+    train_loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        collate_fn=collate_fn,
+        shuffle=True,
     )
-    policy_loss_per_sample *= advantage
-    policy_loss = policy_loss_per_sample.mean()
 
-    # from IPython import embed
-    # embed()
+    # Accumulate stats across all batches
+    total_loss = 0.0
+    total_policy_loss = 0.0
+    total_entropy_loss = 0.0
+    total_value_loss = 0.0
+    total_grad_norm = 0.0
+    total_entropy = 0.0
+    total_kl = 0.0
+    max_kl = 0.0
+    num_batches = 0
 
-    # entropy regularization
-    masked_probs = torch.masked.softmax(action_logits, dim=1, mask=~action_mask)
-    entropy_per_sample = -torch.masked.sum(masked_probs * (masked_probs + 1e-8).log(), dim=1, mask=~action_mask)
-    entropy_loss = -beta * entropy_per_sample.mean()
+    for minibatch in train_loader:
+        # now we create a single batched input tensor
+        input_batch = minibatch["input_batch"]
+        target_batch = minibatch["target_batch"]
+        action_mask = minibatch["action_mask"]
+        advantage = minibatch["advantage"]
+        rtg_batch = minibatch["future_reward"]
+        old_policy_logprobs = minibatch["old_logprobs"]
 
-    # value loss for the learned baseline
-    value_logits = value_logits.view(-1)
-    value_loss_per_sample = F.smooth_l1_loss(value_logits, rtg_batch, reduction="none")
-    value_loss = critic_strength * value_loss_per_sample.mean()
+        if device is not None:
+            input_batch = input_batch.to(device)
+            target_batch = target_batch.to(device)
+            action_mask = action_mask.to(device)
+            advantage = advantage.to(device)
+            old_policy_logprobs = old_policy_logprobs.to(device)
 
-    # combine all losses
-    loss = policy_loss + entropy_loss + value_loss
+        # now that the data is prepared, we compute the loss and take an optimizer step
+        # actor_model.train()
+        # critic_model.train()
+        model.train()
 
-    # now we backprop
-    loss.backward()
-
-    # clip gradnorm and take an optimizer step
-    # actor_grad_norm = torch.nn.utils.clip_grad_norm_(actor_model.parameters(), 1.0)
-    # critic_grad_norm = torch.nn.utils.clip_grad_norm_(critic_model.parameters(), 1.0)
-    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    # grad_norm = actor_grad_norm + critic_grad_norm
-    # actor_optimizer.step()
-    # critic_optimizer.step()
-    # actor_optimizer.zero_grad()
-    # critic_optimizer.zero_grad()
-    optimizer.step()
-    optimizer.zero_grad()
-    # current_lr = actor_lr_scheduler.get_last_lr()[0] if actor_lr_scheduler is not None else 0.0
-    # critic_current_lr = critic_lr_scheduler.get_last_lr()[0] if critic_lr_scheduler is not None else 0.0
-    # if actor_lr_scheduler is not None:
-    #     actor_lr_scheduler.step()
-    # if critic_lr_scheduler is not None:
-    #     critic_lr_scheduler.step()
-    current_lr = lr_scheduler.get_last_lr()[0] if lr_scheduler is not None else 0.0
-    lr_scheduler.step()
-    
-    # here we compute KL(old||new)
-    with torch.no_grad():
-        # new policy
-        # new_action_logits, _ = actor_model(
-        #     inputs=input_batch
+        # action_logits, _ = actor_model(
+        #     inputs=input_batch,
         # )
-        new_action_logits, _ = model(input_batch)
-        new_action_logits: torch.Tensor = new_action_logits
-        new_action_logits = torch.masked_fill(new_action_logits, action_mask, float('-inf'))
+        # _, value_logits = critic_model(
+        #     inputs=input_batch,
+        # )
+        action_logits, value_logits = model(input_batch)
 
-        # we must compute softmax across the new logits but only
-        # where the moves are valid
+        targets = target_batch.to(device=action_logits.device)
 
-        # calculate the probs
-        # new_action_probs = torch.softmax(new_action_logits, dim=1)
+        # convert (B, 1) into (B, 1)
+        # targets = targets.squeeze(0)
+        masked_action_logits = torch.masked_fill(action_logits, action_mask, float("-inf"))
 
-        # next we calculate P(old)/P(new)
-        old_probs = torch.masked.softmax(action_logits, mask=~action_mask, dim=1) 
-        new_probs = torch.masked.softmax(new_action_logits, dim=1, mask=~action_mask)
+        # compute the advantaged cross-entropy loss
+        new_policy_logprobs = masked_action_logits.log_softmax(dim=-1)  # (B, T)
+        assert new_policy_logprobs.shape == old_policy_logprobs.shape, (
+            f"{new_policy_logprobs.shape=} == {old_policy_logprobs.shape=}"
+        )
 
-        per_sample_kl = torch.masked.sum(old_probs * (old_probs / new_probs).log(), dim=1, mask=~action_mask)
-        
+        # next, we need to pluck out the actions taken by the agent in order
+        new_logprobs = torch.gather(
+            new_policy_logprobs,
+            dim=-1,
+            index=targets.unsqueeze(1),  # we want to extend into this direction
+        )
+        old_logprobs = torch.gather(
+            old_policy_logprobs,
+            dim=-1,
+            index=targets.unsqueeze(1),
+        )
 
+        # PPO-clip importance ratio:
+        eps = 0.1
+        importance_ratio = (new_logprobs - old_logprobs).squeeze(1).clamp(-20, 20)
+        importance_ratio = importance_ratio.exp()
+        clipped = importance_ratio.clamp(1 - eps, 1 + eps)
+        assert advantage.shape == importance_ratio.shape, f"{advantage.shape} != {importance_ratio.shape}"
+        ppo_loss = -torch.minimum(advantage * importance_ratio, advantage * clipped)
+        # rho = e^( log(p(old)) - log(p(new)) )
+        # L_clip = min(A*rho, clip(rho, 1-eps, 1+eps)*A)
 
+        # policy_loss_per_sample = F.cross_entropy(input=masked_action_logits, target=targets, reduction="none")
+        policy_loss_per_sample = ppo_loss
+        policy_loss = policy_loss_per_sample.mean()
 
-    # collect stats for logging
+        # from IPython import embed
+        # embed()
+
+        # entropy regularization
+        masked_probs = torch.masked.softmax(action_logits, dim=1, mask=~action_mask)
+        entropy_per_sample = -torch.masked.sum(masked_probs * (masked_probs + 1e-8).log(), dim=1, mask=~action_mask)
+        entropy_loss = -beta * entropy_per_sample.mean()
+
+        # value loss for the learned baseline
+        value_logits = value_logits.view(-1)
+        value_loss_per_sample = F.smooth_l1_loss(value_logits, rtg_batch, reduction="none")
+        value_loss = critic_strength * value_loss_per_sample.mean()
+
+        # combine all losses
+        loss = policy_loss + entropy_loss + value_loss
+
+        # now we backprop
+        loss.backward()
+        # clip gradnorm and take an optimizer step
+        # actor_grad_norm = torch.nn.utils.clip_grad_norm_(actor_model.parameters(), 1.0)
+        # critic_grad_norm = torch.nn.utils.clip_grad_norm_(critic_model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # grad_norm = actor_grad_norm + critic_grad_norm
+        # actor_optimizer.step()
+        # critic_optimizer.step()
+        # actor_optimizer.zero_grad()
+        # critic_optimizer.zero_grad()
+        optimizer.step()
+        optimizer.zero_grad()
+        # current_lr = actor_lr_scheduler.get_last_lr()[0] if actor_lr_scheduler is not None else 0.0
+        # critic_current_lr = critic_lr_scheduler.get_last_lr()[0] if critic_lr_scheduler is not None else 0.0
+        # if actor_lr_scheduler is not None:
+        #     actor_lr_scheduler.step()
+        # if critic_lr_scheduler is not None:
+        #     critic_lr_scheduler.step()
+        current_lr = lr_scheduler.get_last_lr()[0] if lr_scheduler is not None else 0.0
+
+        # here we compute KL(old||new)
+        with torch.no_grad():
+            # new policy
+            # new_action_logits, _ = actor_model(
+            #     inputs=input_batch
+            # )
+            new_action_logits, _ = model(input_batch)
+            new_action_logits: torch.Tensor = new_action_logits
+            new_action_logits = torch.masked_fill(new_action_logits, action_mask, float("-inf"))
+
+            # we must compute softmax across the new logits but only
+            # where the moves are valid
+
+            # calculate the probs
+            # new_action_probs = torch.softmax(new_action_logits, dim=1)
+
+            # next we calculate P(old)/P(new)
+            old_probs = torch.masked.softmax(action_logits, mask=~action_mask, dim=1)
+            new_probs = torch.masked.softmax(new_action_logits, dim=1, mask=~action_mask)
+
+            per_sample_kl = torch.masked.sum(old_probs * (old_probs / new_probs).log(), dim=1, mask=~action_mask)
+
+        # Print batch statistics
+        batch_kl = per_sample_kl.mean().item()
+        batch_entropy = entropy_per_sample.mean().item()
+        # print(
+        #     f"Batch {num_batches + 1}: loss={loss.item():.4f}, policy={policy_loss.item():.4f}, "
+        #     f"value={value_loss.item():.4f}, entropy={batch_entropy:.4f}, kl={batch_kl:.4f}, "
+        #     f"grad_norm={grad_norm.item():.4f}"
+        # )
+
+        # Accumulate stats
+        total_loss += loss.detach().cpu().item()
+        total_policy_loss += policy_loss.detach().cpu().item()
+        total_entropy_loss += entropy_loss.detach().cpu().item()
+        total_value_loss += value_loss.detach().cpu().item()
+        total_grad_norm += grad_norm.detach().cpu().item()
+        total_entropy += entropy_per_sample.mean().detach().cpu().item()
+        total_kl += per_sample_kl.sum().detach().cpu().item()
+        max_kl = max(max_kl, per_sample_kl.max().detach().cpu().item())
+        num_batches += 1
+
+    # collect averaged stats for logging
+    lr_scheduler.step()
     stats = {
-        "loss": loss.detach().cpu().item(),
-        "policy_loss": policy_loss.detach().cpu().item(),
-        "entropy_loss": entropy_loss.detach().cpu().item(),
-        "value_loss": value_loss.detach().cpu().item(),
+        "loss": total_loss / num_batches,
+        "policy_loss": total_policy_loss / num_batches,
+        "entropy_loss": total_entropy_loss / num_batches,
+        "value_loss": total_value_loss / num_batches,
         # "actor_grad_norm": actor_grad_norm.detach().cpu().item(),
         # "critic_grad_norm": critic_grad_norm.detach().cpu().item(),
-        "grad_norm": grad_norm.detach().cpu().item(),
-        "entropy": entropy_per_sample.mean().detach().cpu().item(),
-        "kl_total": per_sample_kl.sum().detach().cpu().item(),
-        "kl_average": per_sample_kl.mean().detach().cpu().item(),
-        "kl_max": per_sample_kl.max().detach().cpu().item(),
+        "grad_norm": total_grad_norm / num_batches,
+        "entropy": total_entropy / num_batches,
+        "kl_total": total_kl,
+        "kl_average": total_kl / num_batches,
+        "kl_max": max_kl,
         # "actor_lr": current_lr,
         # "critic_lr": critic_current_lr,
         "lr": current_lr,
@@ -470,7 +573,6 @@ def calculate_advantage(
     - topological_delta rewards proper tile organization (neighbors, gaps, density)
     - win_bonus is a one-time reward for creating the 2048 tile (exponent 11)
     """
-    
 
     # 2048 = 2^11, so exponent is 11
     WIN_TILE_EXPONENT = 11
@@ -478,22 +580,20 @@ def calculate_advantage(
     # first we calculate the reward of each step
     for ep in episodes:
         for i, move in enumerate(ep["moves"]):
-
             # We have two types of rewards: absolute and shaped (PBRS)
             points_reward = move["points_earned"] * points_weight
-            absolute_reward = (
-                points_reward  # this is what each step gets no matter what
-            )
+            absolute_reward = points_reward  # this is what each step gets no matter what
 
             # Shaped reward, Potential-Based Reward Shaping (PBRS) - only use monotonicity for right now
             # allows us to provide relative rewawrds within each steps which get cancelled out once
             # the discounted reward is calculated.
             # mono_after = move["monotonicity_after"] if not last_step else 0.0
-            shaped_reward = sum([
-                monotonicity_weight * (discount_rate * move["monotonicity_after"]  - move["monotonicity_before"]),
-                emptiness_weight * (discount_rate * move["emptiness_after"] - move["emptiness_before"])
-            ])
-            
+            shaped_reward = sum(
+                [
+                    monotonicity_weight * (discount_rate * move["monotonicity_after"] - move["monotonicity_before"]),
+                    emptiness_weight * (discount_rate * move["emptiness_after"] - move["emptiness_before"]),
+                ]
+            )
 
             # # zero this out on the final step
             # if last_step:
@@ -509,7 +609,6 @@ def calculate_advantage(
             G = move["reward"] + discount_rate * G
             move["future_reward_raw"] = G
 
-
     # next, calculate statistics of the current batch so we can have them after we normalize
     eps = 1e-8
     future_rewards_raw = [m["future_reward_raw"] for ep in episodes for m in ep["moves"]]
@@ -519,18 +618,13 @@ def calculate_advantage(
 
     # first, calculate the batch statistics for the return-to-go
     rtg_batch_mean = sum(future_rewards_raw) / N
-    rtg_batch_var = (
-        0.0
-        if N <= 1
-        else sum((fr - rtg_batch_mean) ** 2 for fr in future_rewards_raw) / N
-    )
-    
+    rtg_batch_var = 0.0 if N <= 1 else sum((fr - rtg_batch_mean) ** 2 for fr in future_rewards_raw) / N
+
     # rtg_updated_first_moment = rtg_beta * rtg_first_moment + (1 - rtg_beta) * rtg_batch_mean
     # rtg_updated_m2 = rtg_beta * rtg_m2 + (1 - rtg_beta) * (
     #     rtg_batch_var + rtg_batch_mean**2
     # )  # this estimates E[G^2]
     # rtg_updated_mu = rtg_beta * rtg_mu + (1 - rtg_beta) * rtg_batch_mean  # this estimates E[G]
-    
 
     # calculate bias-corrected moments
     bias_correction = max(1 - rtg_beta ** max(rtg_step, 1), eps)
@@ -543,27 +637,24 @@ def calculate_advantage(
     rtg_var = max(rtg_m2_corrected - rtg_mu_corrected**2, eps)
     rtg_stddev = rtg_var**0.5
 
-
     # finally, we compute the normalized rtg
     for ep in episodes:
         for move in ep["moves"]:
             # triangle swap
-            move["future_reward"] = (move["future_reward_raw"] - rtg_mu_corrected) / (
-                rtg_stddev + eps
-            )
+            move["future_reward"] = (move["future_reward_raw"] - rtg_mu_corrected) / (rtg_stddev + eps)
 
     # calculate advantage using timestep-specific baselines in the normalized space
     for ep in episodes:
         for m in ep["moves"]:
             baseline = m["predicted_future_value"]
             # we want it to be disconnected at this point
-            assert all(
-                not isinstance(v, torch.Tensor) for v in [m["future_reward"], baseline]
-            ), "one of the variables in advantage computation is a tensor"
+            assert all(not isinstance(v, torch.Tensor) for v in [m["future_reward"], baseline]), (
+                "one of the variables in advantage computation is a tensor"
+            )
 
             # computed in the normalized space
             m["advantage"] = m["future_reward"] - baseline
-    
+
     # create new samples via augmentation (mirroring and rotation)
     augmented_steps: list[StepData] = []
     steps_to_upsample = int(N * upsample_ratio)
@@ -573,7 +664,7 @@ def calculate_advantage(
 
         # direction indices: 0=UP, 1=DOWN, 2=LEFT, 3=RIGHT
         dirs = [Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT]
-        
+
         def remap_direction_mirror(dir_idx: int, mirror_axis: str) -> int:
             """Remap direction index after mirroring."""
             d = dirs[dir_idx]
@@ -584,7 +675,7 @@ def calculate_advantage(
             else:
                 return dir_idx
             return dirs.index(new_d)
-        
+
         def remap_direction_rotate(dir_idx: int, degrees: int) -> int:
             """Remap direction index after clockwise rotation."""
             # rotation maps: 90° CW: UP->RIGHT, RIGHT->DOWN, DOWN->LEFT, LEFT->UP
@@ -599,7 +690,7 @@ def calculate_advantage(
             for _ in range(rotations):
                 d = rotate_90[d]
             return dirs.index(d)
-        
+
         def remap_action_mask(mask: list[bool], remap_fn, *args) -> list[bool]:
             """Remap action mask using the same direction remapping."""
             new_mask = [False] * 4
@@ -619,20 +710,20 @@ def calculate_advantage(
                 mirror_axis = random.choice(["horizontal", "vertical"])
                 mirrored_before = Game2048.mirror_grid(old_state_before, mirror_axis)
                 mirrored_after = Game2048.mirror_grid(old_state_after, mirror_axis)
-                
+
                 augmented_step["state_before"] = mirrored_before
                 augmented_step["result_state"] = mirrored_after
                 augmented_step["game_state"] = Game2048(mirrored_before).to_model_format()
                 augmented_step["points_possible"] = Game2048(mirrored_before).preview_move_rewards()
-                
+
                 old_dir_idx = augmented_step.pop("selected_direction")
                 augmented_step["selected_direction"] = remap_direction_mirror(old_dir_idx, mirror_axis)
-                
+
                 old_mask = augmented_step.pop("action_mask", [False] * 4)
                 augmented_step["action_mask"] = remap_action_mask(old_mask, remap_direction_mirror, mirror_axis)
-                
+
                 augmented_steps.append(augmented_step)
-            
+
             # chance of rotation (independent of mirroring, uses original step)
             if random.random() < 0.5:
                 augmented_step: StepData = deepcopy(step)
@@ -643,20 +734,19 @@ def calculate_advantage(
                 degrees = random.choice([90, 180, 270])
                 rotated_before = Game2048.rotate_grid(old_state_before, degrees)
                 rotated_after = Game2048.rotate_grid(old_state_after, degrees)
-                
+
                 augmented_step["state_before"] = rotated_before
                 augmented_step["result_state"] = rotated_after
                 augmented_step["game_state"] = Game2048(rotated_before).to_model_format()
                 augmented_step["points_possible"] = Game2048(rotated_before).preview_move_rewards()
-                
+
                 old_dir_idx = augmented_step.pop("selected_direction")
                 augmented_step["selected_direction"] = remap_direction_rotate(old_dir_idx, degrees)
-                
+
                 old_mask = augmented_step.pop("action_mask", [False] * 4)
                 augmented_step["action_mask"] = remap_action_mask(old_mask, remap_direction_rotate, degrees)
-                
-                augmented_steps.append(augmented_step)
 
+                augmented_steps.append(augmented_step)
 
     # # stabilize policy updates: center and scale advantages within the batch
     # advantages = [m["advantage"] for ep in episodes for m in ep["moves"]]
@@ -665,21 +755,18 @@ def calculate_advantage(
     # adv_std = adv_var**0.5
     # for ep in episodes:
     #     for m in ep["moves"]:
-            # m["advantage"] = (m["advantage"] - adv_mean) / (adv_std + eps)
+    # m["advantage"] = (m["advantage"] - adv_mean) / (adv_std + eps)
 
     # finally, we compute updated rtg moments using the batch statistics
     # We wait until the end to do this so that the loss between the current value head and
     # the advantage is based on the same distribution
-    
+
     # next, calculate new moments using current batch statistics
     # (we do this AFTER normalizing the batch to prevent noise from entering value head)
     rtg_updated_first_moment = rtg_beta * rtg_first_moment + (1 - rtg_beta) * rtg_batch_mean
-    rtg_updated_m2 = rtg_beta * rtg_m2 + (1 - rtg_beta) * (
-        rtg_batch_var + rtg_batch_mean**2
-    )  # this estimates E[G^2]
+    rtg_updated_m2 = rtg_beta * rtg_m2 + (1 - rtg_beta) * (rtg_batch_var + rtg_batch_mean**2)  # this estimates E[G^2]
     rtg_updated_mu = rtg_beta * rtg_mu + (1 - rtg_beta) * rtg_batch_mean  # this estimates E[G]
     rtg_updated_first_moment = rtg_updated_mu  # keep both mean trackers aligned
-
 
     # we return the new moments
     return episodes, augmented_steps, rtg_updated_first_moment, rtg_updated_m2, rtg_updated_mu
@@ -688,6 +775,7 @@ def calculate_advantage(
 @dataclass
 class RewardWeights:
     """Container for reward component weights."""
+
     points: float = 0.0
     smoothness: float = 0.0
     max_tile: float = 0.0
@@ -754,9 +842,7 @@ def compute_batch_stats(
     adv_std = adv_var**0.5
     v_std = v_var**0.5
     future_raw_std = future_var**0.5
-    variance_reduction = (
-        (future_norm_std - adv_std) / future_norm_std * 100 if future_norm_std > 0 else 0.0
-    )
+    variance_reduction = (future_norm_std - adv_std) / future_norm_std * 100 if future_norm_std > 0 else 0.0
     explained_var = 1.0 - adv_var / future_norm_var if future_norm_var > 0 else 0.0
     updated_ema_explained_var = (1 - ema_decay) * ema_explained_var + ema_decay * explained_var
 
@@ -825,9 +911,7 @@ def print_episode_breakdown(
     if not episode.get("moves"):
         return
 
-    logger.print(
-        f"\n  Best game this batch (score: {episode['total_points']}, steps: {episode['total_steps']}):"
-    )
+    logger.print(f"\n  Best game this batch (score: {episode['total_points']}, steps: {episode['total_steps']}):")
 
     moves = episode["moves"]
     total_points = sum(m.get("points_earned", 0) for m in moves)
@@ -970,9 +1054,11 @@ def export_episode_visualization(
                 "corner": move.get("corner_delta", 0) * weights.corner,
                 "adjacency": move.get("adjacency_delta", 0) * weights.adjacency,
                 "chain": move.get("chain_delta", 0) * weights.chain,
-                "monotonicity": (discount_rate * move.get("monotonicity_after", 0) - move.get("monotonicity_before", 0)) * weights.monotonicity,
+                "monotonicity": (discount_rate * move.get("monotonicity_after", 0) - move.get("monotonicity_before", 0))
+                * weights.monotonicity,
                 "topological": move.get("topological_delta", 0) * weights.topological,
-                "emptiness": (discount_rate * move.get("emptiness_after", 0) - move.get("emptiness_before", 0)) * weights.emptiness,
+                "emptiness": (discount_rate * move.get("emptiness_after", 0) - move.get("emptiness_before", 0))
+                * weights.emptiness,
             },
             "entropy": move.get("entropy", 0.0),
             "advantage": move.get("advantage", 0.0),
@@ -984,80 +1070,47 @@ def export_episode_visualization(
         json.dump(viz_data, f, indent=2)
 
 
-
-
-
-
 @app.command()
 def train(
     steps: int = typer.Option(1000, "--steps", "-s", help="Number of training steps"),
-    model_path: Optional[Path] = typer.Option(
-        None, "--model", "-m", help="Path to save/load model"
-    ),
+    model_path: Optional[Path] = typer.Option(None, "--model", "-m", help="Path to save/load model"),
     learning_rate: float = typer.Option(0.001, "--lr", help="Learning rate"),
     gamma: float = typer.Option(0.99, "--gamma", help="Discount factor"),
-    entropy_strength: float = typer.Option(
-        0.1, "--entropy", help="Parmaeter for controlling entropy regularization."
-    ),
+    entropy_strength: float = typer.Option(0.1, "--entropy", help="Parmaeter for controlling entropy regularization."),
     critic_strength: float = typer.Option(
         1.0,
         "--critic",
         help="Strength of the critic (estimated reward-to-go) during loss computation",
     ),
     epsilon: float = typer.Option(1.0, "--epsilon", help="Initial exploration rate"),
-    momentum: float = typer.Option(
-        0.99, "--momentum", help="Momentum used for the EMA of average reward"
-    ),
-    batch_size: int = typer.Option(
-        1, "--batch-size", help="Number of games to play in a given batch"
-    ),
-    workers: int = typer.Option(
-        1, "--workers", "-w", help="Number of parallel workers for game execution"
-    ),
-    max_steps: int = typer.Option(
-        None, "--max-steps", help="Maximum number of steps a game can reach."
-    ),
-    hidden_size: int = typer.Option(
-        64, "-h", "--hidden", help="hidden capacity of the model"
-    ),
-    num_layers: int = typer.Option(
-        2, "--num-layers", "-l", help="Number of residual hidden layers"
-    ),
-    model_type: str = typer.Option(
-        "mlp", "--model-type", "-t", help="Model architecture: 'mlp' or 'urm'"
-    ),
+    momentum: float = typer.Option(0.99, "--momentum", help="Momentum used for the EMA of average reward"),
+    num_episodes: int = typer.Option(1, "--episodes", help="Number of games to play in a given batch"),
+    batch_size: int = typer.Option(1, "--batch-size", help="Minibatch size when updating policy"),
+    workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel workers for game execution"),
+    max_steps: int = typer.Option(None, "--max-steps", help="Maximum number of steps a game can reach."),
+    hidden_size: int = typer.Option(64, "-h", "--hidden", help="hidden capacity of the model"),
+    num_layers: int = typer.Option(2, "--num-layers", "-l", help="Number of residual hidden layers"),
+    model_type: str = typer.Option("mlp", "--model-type", "-t", help="Model architecture: 'mlp' or 'urm'"),
     # URM-specific options
-    num_heads: int = typer.Option(
-        4, "--num-heads", help="Number of attention heads (URM only)"
-    ),
-    num_loops: int = typer.Option(
-        4, "--num-loops", help="Number of recurrent reasoning loops (URM only)"
-    ),
+    num_heads: int = typer.Option(4, "--num-heads", help="Number of attention heads (URM only)"),
+    num_loops: int = typer.Option(4, "--num-loops", help="Number of recurrent reasoning loops (URM only)"),
     num_truncated_loops: int = typer.Option(
         1,
         "--truncated-loops",
         help="Loops without gradients for memory savings (URM only)",
     ),
-    print_frequency: int = typer.Option(
-        10, "--print-freq", "-p", help="Printing frequency"
-    ),
+    print_frequency: int = typer.Option(10, "--print-freq", "-p", help="Printing frequency"),
     show_last_steps: int = typer.Option(
         0,
         "--show-last-steps",
         help="Show the last N steps of the best game (0 = disabled)",
     ),
-    points_weight: float = typer.Option(
-        0.0, "--points", help="Weight for raw game points (0 = disabled)"
-    ),
+    points_weight: float = typer.Option(0.0, "--points", help="Weight for raw game points (0 = disabled)"),
     smoothness_weight: float = typer.Option(
         0.0, "--smoothness", help="Weight for smoothness reward shaping (0 = disabled)"
     ),
-    max_tile_weight: float = typer.Option(
-        0.0, "--tile-bonus", help="Weight for max tile created bonus (0 = disabled)"
-    ),
-    corner_weight: float = typer.Option(
-        0.0, "--corner", help="Weight for corner bonus (max tile in corner)"
-    ),
+    max_tile_weight: float = typer.Option(0.0, "--tile-bonus", help="Weight for max tile created bonus (0 = disabled)"),
+    corner_weight: float = typer.Option(0.0, "--corner", help="Weight for corner bonus (max tile in corner)"),
     adjacency_weight: float = typer.Option(
         0.0,
         "--adjacency",
@@ -1160,7 +1213,7 @@ def train(
         "gamma": gamma,
         "beta": entropy_strength,
         "critic_strength": critic_strength,
-        "batch_size": batch_size,
+        "batch_size": num_episodes,
         "hidden_size": hidden_size,
         "num_layers": num_layers,
         "model_type": model_type,
@@ -1206,9 +1259,7 @@ def train(
         # Create model based on model_type
         model_type_lower = model_type.lower()
         if model_type_lower == "mlp":
-            logger.print(
-                f"Creating GameMLP model (hidden={hidden_size}, layers={num_layers})"
-            )
+            logger.print(f"Creating GameMLP model (hidden={hidden_size}, layers={num_layers})")
             # actor_model = GameMLP(MLPConfig(hidden_dim=hidden_size, num_layers=num_layers))
             # critic_model = GameMLP(MLPConfig(hidden_dim=hidden_size, num_layers=num_layers, decouple_critic=False))
             model = GameMLP(MLPConfig(hidden_dim=hidden_size, num_layers=num_layers, decouple_critic=decouple_critic))
@@ -1220,6 +1271,7 @@ def train(
             logger.print("this model type is not available")
             logger.close()
             import sys
+
             sys.exit(1)
             # model = GameURM(
             #     GameURMConfig(
@@ -1317,9 +1369,7 @@ def train(
     # helper to get max tile from episode
     def get_max_tile(ep):
         if "final_state" in ep:
-            return max(
-                2**cell if cell > 0 else 0 for row in ep["final_state"] for cell in row
-            )
+            return max(2**cell if cell > 0 else 0 for row in ep["final_state"] for cell in row)
         return 0
 
     for train_step in tqdm(range(steps), desc=f"Running RL training"):
@@ -1347,12 +1397,12 @@ def train(
             # with ProcessPoolExecutor(max_workers=workers) as executor:
             #     rollout_episodes = list(executor.map(_worker_play_game, worker_args))
         else:
-            for _ in range(batch_size):
+            for _ in range(num_episodes):
                 rollout_episodes.append(
                     # play_game_for_episode(actor_model, critic_model, max_steps=max_steps, device=device)
                     play_game_for_episode(model, max_steps=max_steps, device=device)
                 )
-        
+
         # rollout_episodes.extend(augment_data_samples(rollout_episodes, upsample_ratio))
 
         # get the updated moments after each batch
@@ -1373,18 +1423,20 @@ def train(
             rtg_beta=rtg_beta,
             rtg_m2=rtg_m2,
             rtg_mu=rtg_mu,
-            rtg_step=train_step+1, # 1-indexed for the correct normalization
+            rtg_step=train_step + 1,  # 1-indexed for the correct normalization
             upsample_ratio=upsample_ratio,
         )
 
         # add augmented steps to episodes
-        rollout_episodes.append({
-            "moves": augmented_steps,
-            "total_points": sum(step["points_earned"] for step in augmented_steps),
-            "total_steps": len(augmented_steps),
-            "augmented": True,
-            "final_state": augmented_steps[-1]["result_state"],
-        })
+        rollout_episodes.append(
+            {
+                "moves": augmented_steps,
+                "total_points": sum(step["points_earned"] for step in augmented_steps),
+                "total_steps": len(augmented_steps),
+                "augmented": True,
+                "final_state": augmented_steps[-1]["result_state"],
+            }
+        )
 
         # Now we update the model's policy using this rollout
         stats = model_optimize_step(
@@ -1401,6 +1453,7 @@ def train(
             entropy_strength,
             critic_strength,
             device,
+            batch_size=batch_size,
         )
 
         # Get highest score from batch and track if we hit a new record
@@ -1410,9 +1463,7 @@ def train(
         highest_score = max(batch_max_score, highest_score)
 
         # Calculate average number of steps in batch
-        avg_steps = sum([len(episode["moves"]) for episode in non_augmented_episodes]) / len(
-            non_augmented_episodes
-        )
+        avg_steps = sum([len(episode["moves"]) for episode in non_augmented_episodes]) / len(non_augmented_episodes)
 
         # compute batch tile stats and update EMAs every step
         max_tiles = [get_max_tile(ep) for ep in non_augmented_episodes]
@@ -1473,7 +1524,6 @@ def train(
             if viz_dir:
                 export_episode_visualization(viz_dir, train_step, best_episode, weights, gamma)
 
-        
         # always save viz data when we hit a new high score (even if not printing)
         if new_high_score and viz_dir and not should_print:
             record_episode = max(non_augmented_episodes, key=lambda ep: ep["total_points"])
@@ -1508,7 +1558,7 @@ def train(
                         seed=i,
                     )
                 )
-            
+
             # Compute evaluation statistics
             eval_scores = [ep["total_points"] for ep in eval_episodes]
             eval_max_score = max(eval_scores)
@@ -1518,7 +1568,7 @@ def train(
             eval_pct_512 = sum(1 for t in eval_max_tiles if t >= 512) / len(eval_episodes) * 100
             eval_pct_1024 = sum(1 for t in eval_max_tiles if t >= 1024) / len(eval_episodes) * 100
             eval_pct_2048 = sum(1 for t in eval_max_tiles if t >= 2048) / len(eval_episodes) * 100
-            
+
             eval_metrics = {
                 "eval/max_score": eval_max_score,
                 "eval/avg_score": eval_avg_score,
@@ -1528,10 +1578,16 @@ def train(
                 "eval/pct_2048": eval_pct_2048,
             }
             logger.log(eval_metrics, step=train_step)
-            
-            typer.echo(f"Eval Results - Max: {eval_max_score:.0f}, Avg: {eval_avg_score:.1f}, Median: {eval_median_score:.0f}", color="green")
-            typer.echo(f"Tiles Reached - 512: {eval_pct_512:.1f}%, 1024: {eval_pct_1024:.1f}%, 2048: {eval_pct_2048:.1f}%", color="green")
-            
+
+            typer.echo(
+                f"Eval Results - Max: {eval_max_score:.0f}, Avg: {eval_avg_score:.1f}, Median: {eval_median_score:.0f}",
+                color="green",
+            )
+            typer.echo(
+                f"Tiles Reached - 512: {eval_pct_512:.1f}%, 1024: {eval_pct_1024:.1f}%, 2048: {eval_pct_2048:.1f}%",
+                color="green",
+            )
+
             # actor_model.train()
             # critic_model.train()
             model.train()
@@ -1632,9 +1688,7 @@ def human():
         typer.echo("🎮 2048 - Human Player Mode")
         typer.echo("Controls: W/↑=Up, S/↓=Down, A/←=Left, D/→=Right, Q=Quit")
         typer.echo("-" * 40)
-        typer.echo(
-            f"Move {move_count}: {direction.value.upper()} (+{points_earned} points)"
-        )
+        typer.echo(f"Move {move_count}: {direction.value.upper()} (+{points_earned} points)")
 
         display_board(game)
 
@@ -1665,12 +1719,8 @@ def display_board(game: Game2048) -> None:
 
 @app.command()
 def play(
-    model_path: Optional[Path] = typer.Option(
-        None, "--model", "-m", help="Path to trained model (optional)"
-    ),
-    delay: float = typer.Option(
-        0.5, "--delay", "-d", help="Delay between moves in seconds"
-    ),
+    model_path: Optional[Path] = typer.Option(None, "--model", "-m", help="Path to trained model (optional)"),
+    delay: float = typer.Option(0.5, "--delay", "-d", help="Delay between moves in seconds"),
 ):
     """Watch the AI play 2048."""
     model = None
@@ -1714,9 +1764,7 @@ def play(
 
         # we look at the possible gains to determine the overall reward
         possible_gains = game.preview_move_rewards()
-        best_direction, highest_points = max(
-            possible_gains.items(), key=lambda item: item[1]
-        )
+        best_direction, highest_points = max(possible_gains.items(), key=lambda item: item[1])
 
         # now agent makes a decision
         model_input = game.to_model_format()
@@ -1732,9 +1780,7 @@ def play(
         action_probs[invalid_mask] = -torch.inf
 
         # now we let the model decide which direction it should move into
-        adjusted_action_dist = torch.softmax(
-            action_probs, dim=0
-        )  # this is the one we want to save
+        adjusted_action_dist = torch.softmax(action_probs, dim=0)  # this is the one we want to save
         selected_action = torch.multinomial(adjusted_action_dist, num_samples=1).item()
         action: Direction = model.directions[selected_action]
 
@@ -1745,9 +1791,7 @@ def play(
 
         # calculate the per-step reward
         if highest_points != 0:
-            step_reward = (
-                1.0 if action == best_direction else points_earned / highest_points
-            )
+            step_reward = 1.0 if action == best_direction else points_earned / highest_points
         else:
             step_reward = 0
 
@@ -1766,12 +1810,8 @@ def play(
         episode_data.append(step_data)
 
         # display move
-        typer.echo(
-            f"\nMove {move_count}: {action.value.upper()} (points earned: {points_earned})"
-        )
-        typer.echo(
-            f"Best available: {best_direction.value.upper()} ({highest_points} points)"
-        )
+        typer.echo(f"\nMove {move_count}: {action.value.upper()} (points earned: {points_earned})")
+        typer.echo(f"Best available: {best_direction.value.upper()} ({highest_points} points)")
         typer.echo(
             f"Step reward: {step_reward:.3f} | Total reward (EMA): {total_reward:.3f} | Bias Corrected: {total_reward_corrected:.3f}"
         )
