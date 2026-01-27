@@ -19,6 +19,7 @@ class Game2048 {
             this.grid = Array(GRID_SIZE).fill(null).map(() => Array(GRID_SIZE).fill(0));
         }
         this.score = 0;
+        this.moveCount = 0;
     }
 
     /**
@@ -27,6 +28,7 @@ class Game2048 {
     reset() {
         this.grid = Array(GRID_SIZE).fill(null).map(() => Array(GRID_SIZE).fill(0));
         this.score = 0;
+        this.moveCount = 0;
         this.addRandomTile();
         this.addRandomTile();
         return this.grid;
@@ -207,6 +209,7 @@ class Game2048 {
 
         this.grid = workingGrid;
         this.score += totalScore;
+        this.moveCount++;
 
         // Add new random tile
         this.addRandomTile();

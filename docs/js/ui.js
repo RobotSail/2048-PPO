@@ -6,39 +6,19 @@
  * - Live mode: Watch the AI play in real-time
  */
 
-// Color scheme matching classic 2048
-const TILE_COLORS = {
-    0: '#cdc1b4',
-    2: '#eee4da',
-    4: '#ede0c8',
-    8: '#f2b179',
-    16: '#f59563',
-    32: '#f67c5f',
-    64: '#f65e3b',
-    128: '#edcf72',
-    256: '#edcc61',
-    512: '#edc850',
-    1024: '#edc53f',
-    2048: '#edc22e',
-    4096: '#3c3a32',
-    8192: '#3c3a32',
-};
-
-const TEXT_COLORS = {
-    0: '#cdc1b4',
-    2: '#776e65',
-    4: '#776e65',
-    8: '#f9f6f2',
-    16: '#f9f6f2',
-    32: '#f9f6f2',
-    64: '#f9f6f2',
-    128: '#f9f6f2',
-    256: '#f9f6f2',
-    512: '#f9f6f2',
-    1024: '#f9f6f2',
-    2048: '#f9f6f2',
-    4096: '#f9f6f2',
-    8192: '#f9f6f2',
+// Speed presets: slider value (1-10) -> milliseconds delay
+// Higher slider value = faster speed
+const SPEED_PRESETS = {
+    1: { ms: 2000, label: '0.5x' },
+    2: { ms: 1000, label: '1x' },
+    3: { ms: 500, label: '2x' },
+    4: { ms: 250, label: '4x' },
+    5: { ms: 150, label: '6x' },
+    6: { ms: 100, label: '10x' },
+    7: { ms: 50, label: '20x' },
+    8: { ms: 25, label: '40x' },
+    9: { ms: 10, label: '100x' },
+    10: { ms: 5, label: '200x' },
 };
 
 class UIController {
@@ -51,11 +31,13 @@ class UIController {
         this.replayData = null;
         this.replayIndex = 0;
         this.replayInterval = null;
-        this.replaySpeed = 500;
+        this.replaySpeedLevel = 5; // Default to 6x speed
+        this.replaySpeed = SPEED_PRESETS[5].ms;
 
         // Live mode state
         this.liveInterval = null;
-        this.liveSpeed = 200;
+        this.liveSpeedLevel = 6; // Default to 10x speed
+        this.liveSpeed = SPEED_PRESETS[6].ms;
         this.isLivePlaying = false;
 
         this.initializeBoard();
@@ -89,17 +71,21 @@ class UIController {
                 const cell = document.getElementById(`cell-${i}-${j}`);
                 const value = grid[i][j];
 
+                // Reset classes and set tile class
+                cell.className = 'cell';
+                if (value > 0) {
+                    cell.classList.add(`tile-${value}`);
+                }
+
                 cell.textContent = value > 0 ? value : '';
-                cell.style.backgroundColor = TILE_COLORS[value] || TILE_COLORS[8192];
-                cell.style.color = TEXT_COLORS[value] || TEXT_COLORS[8192];
 
                 // Adjust font size for large numbers
                 if (value >= 1000) {
-                    cell.style.fontSize = '28px';
+                    cell.style.fontSize = '24px';
                 } else if (value >= 100) {
-                    cell.style.fontSize = '36px';
+                    cell.style.fontSize = '32px';
                 } else {
-                    cell.style.fontSize = '48px';
+                    cell.style.fontSize = '';
                 }
             }
         }
@@ -143,6 +129,21 @@ class UIController {
     }
 
     /**
+     * Update the step slider and label.
+     */
+    updateStepSlider() {
+        if (!this.replayData || !this.replayData.moves) return;
+
+        const maxStep = this.replayData.moves.length;
+        const slider = document.getElementById('replay-step-slider');
+        const label = document.getElementById('replay-step-label');
+
+        slider.max = maxStep;
+        slider.value = this.replayIndex;
+        label.textContent = `Step ${this.replayIndex} / ${maxStep}`;
+    }
+
+    /**
      * Bind UI event handlers.
      */
     bindEvents() {
@@ -157,9 +158,25 @@ class UIController {
         document.getElementById('replay-next').addEventListener('click', () => this.replayNext());
         document.getElementById('replay-end').addEventListener('click', () => this.replayGoToEnd());
 
+        // Replay step slider (draggable progress bar)
+        document.getElementById('replay-step-slider').addEventListener('input', (e) => {
+            this.replayPause();
+            this.replayIndex = parseInt(e.target.value);
+            this.replayShowFrame();
+        });
+
+        // Replay speed slider (1-10 scale, higher = faster)
         document.getElementById('replay-speed').addEventListener('input', (e) => {
-            this.replaySpeed = parseInt(e.target.value);
-            document.getElementById('replay-speed-value').textContent = `${this.replaySpeed}ms`;
+            this.replaySpeedLevel = parseInt(e.target.value);
+            const preset = SPEED_PRESETS[this.replaySpeedLevel];
+            this.replaySpeed = preset.ms;
+            document.getElementById('replay-speed-value').textContent = preset.label;
+
+            // If playing, restart with new speed
+            if (this.replayInterval) {
+                this.replayPause();
+                this.replayPlay();
+            }
         });
 
         // Live controls
@@ -167,9 +184,36 @@ class UIController {
         document.getElementById('live-stop').addEventListener('click', () => this.liveStop());
         document.getElementById('live-reset').addEventListener('click', () => this.liveReset());
 
+        // Live speed slider (1-10 scale, higher = faster)
         document.getElementById('live-speed').addEventListener('input', (e) => {
-            this.liveSpeed = parseInt(e.target.value);
-            document.getElementById('live-speed-value').textContent = `${this.liveSpeed}ms`;
+            this.liveSpeedLevel = parseInt(e.target.value);
+            const preset = SPEED_PRESETS[this.liveSpeedLevel];
+            this.liveSpeed = preset.ms;
+            document.getElementById('live-speed-value').textContent = preset.label;
+        });
+
+        // Keyboard controls
+        document.addEventListener('keydown', (e) => {
+            if (this.mode === 'replay' && this.replayData) {
+                switch (e.key) {
+                    case 'ArrowLeft':
+                        this.replayPrev();
+                        break;
+                    case 'ArrowRight':
+                        this.replayNext();
+                        break;
+                    case ' ':
+                        e.preventDefault();
+                        this.replayTogglePlay();
+                        break;
+                    case 'Home':
+                        this.replayGoToStart();
+                        break;
+                    case 'End':
+                        this.replayGoToEnd();
+                        break;
+                }
+            }
         });
     }
 
@@ -190,6 +234,9 @@ class UIController {
                 document.getElementById('best-game-score').textContent = this.replayData.score;
                 document.getElementById('best-game-moves').textContent = this.replayData.total_steps;
 
+                // Initialize step slider
+                this.updateStepSlider();
+
                 // Show initial state
                 if (this.replayData.moves && this.replayData.moves.length > 0) {
                     console.log('Rendering initial board state...');
@@ -209,10 +256,10 @@ class UIController {
         console.log('Model loaded:', modelLoaded);
         if (modelLoaded) {
             document.getElementById('model-status').textContent = 'Ready';
-            document.getElementById('model-status').style.color = '#4CAF50';
+            document.getElementById('model-status').style.color = '#3fb950';
         } else {
             document.getElementById('model-status').textContent = 'Failed to load';
-            document.getElementById('model-status').style.color = '#f44336';
+            document.getElementById('model-status').style.color = '#f85149';
             console.error('Model load error:', this.model.loadError);
         }
     }
@@ -252,7 +299,7 @@ class UIController {
 
     replayGoToEnd() {
         if (!this.replayData) return;
-        this.replayIndex = this.replayData.moves.length - 1;
+        this.replayIndex = this.replayData.moves.length;
         this.replayShowFrame();
     }
 
@@ -265,7 +312,7 @@ class UIController {
 
     replayNext() {
         if (!this.replayData) return;
-        if (this.replayIndex < this.replayData.moves.length - 1) {
+        if (this.replayIndex < this.replayData.moves.length) {
             this.replayIndex++;
             this.replayShowFrame();
         } else {
@@ -284,9 +331,20 @@ class UIController {
     replayPlay() {
         if (!this.replayData) return;
 
+        // If at end, restart from beginning
+        if (this.replayIndex >= this.replayData.moves.length) {
+            this.replayIndex = 0;
+        }
+
         document.getElementById('replay-play').textContent = '⏸';
+        document.getElementById('replay-play').title = 'Pause';
         this.replayInterval = setInterval(() => {
-            this.replayNext();
+            if (this.replayIndex < this.replayData.moves.length) {
+                this.replayIndex++;
+                this.replayShowFrame();
+            } else {
+                this.replayPause();
+            }
         }, this.replaySpeed);
     }
 
@@ -296,26 +354,40 @@ class UIController {
             this.replayInterval = null;
         }
         document.getElementById('replay-play').textContent = '▶';
+        document.getElementById('replay-play').title = 'Play';
     }
 
     replayShowFrame() {
         if (!this.replayData || !this.replayData.moves) return;
 
-        const move = this.replayData.moves[this.replayIndex];
-        if (!move) return;
+        const moves = this.replayData.moves;
 
-        // Show state after move (or state_before for first frame)
-        const grid = this.replayIndex === 0 ? move.state_before : move.state_after;
-        this.renderBoard(grid);
+        // Update step slider
+        this.updateStepSlider();
 
-        // Calculate cumulative score up to this point
-        let cumulativeScore = 0;
-        for (let i = 0; i <= this.replayIndex; i++) {
-            cumulativeScore += this.replayData.moves[i].points_earned || 0;
+        if (this.replayIndex === 0) {
+            // Show initial state (before first move)
+            if (moves[0] && moves[0].state_before) {
+                this.renderBoard(moves[0].state_before);
+            }
+            this.updateScore(0, 0);
+            this.updateAction('-');
+        } else {
+            // Show state after move at replayIndex - 1
+            const move = moves[this.replayIndex - 1];
+            if (move) {
+                this.renderBoard(move.state_after);
+
+                // Calculate cumulative score up to this point
+                let cumulativeScore = 0;
+                for (let i = 0; i < this.replayIndex; i++) {
+                    cumulativeScore += moves[i].points_earned || 0;
+                }
+
+                this.updateScore(cumulativeScore, this.replayIndex);
+                this.updateAction(move.action, move.points_earned);
+            }
         }
-
-        this.updateScore(cumulativeScore, this.replayIndex + 1);
-        this.updateAction(move.action, move.points_earned);
     }
 
     // ==================== LIVE MODE ====================
@@ -370,12 +442,8 @@ class UIController {
 
             // Update display
             this.renderBoard(this.game.grid);
-            this.updateScore(this.game.score, this.game.score > 0 ? Math.floor(Math.log2(this.game.score)) : 0);
+            this.updateScore(this.game.score, this.game.moveCount);
             this.updateAction(action, pointsEarned);
-
-            // Calculate move count (approximate)
-            const moveCount = document.getElementById('move-count');
-            moveCount.textContent = parseInt(moveCount.textContent || 0) + 1;
 
             if (done) {
                 this.liveStop();

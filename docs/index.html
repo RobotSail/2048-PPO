@@ -46,17 +46,22 @@
                 <!-- Replay Controls -->
                 <div id="replay-controls" class="controls">
                     <h3>Replay Controls</h3>
+                    <!-- Step slider for jumping to any point -->
+                    <div class="step-slider-row">
+                        <span id="replay-step-label" class="step-label">Step 0 / 0</span>
+                        <input type="range" id="replay-step-slider" min="0" max="100" value="0">
+                    </div>
                     <div class="control-row">
                         <button id="replay-start" class="control-btn" title="Go to start">⏮</button>
                         <button id="replay-prev" class="control-btn" title="Previous move">◀</button>
-                        <button id="replay-play" class="control-btn" title="Play/Pause">▶</button>
+                        <button id="replay-play" class="control-btn primary" title="Play/Pause">▶</button>
                         <button id="replay-next" class="control-btn" title="Next move">▶</button>
                         <button id="replay-end" class="control-btn" title="Go to end">⏭</button>
                     </div>
-                    <div class="control-row">
+                    <div class="speed-row">
                         <label for="replay-speed">Speed:</label>
-                        <input type="range" id="replay-speed" min="100" max="2000" value="500" step="100">
-                        <span id="replay-speed-value">500ms</span>
+                        <input type="range" id="replay-speed" min="1" max="10" value="5" step="1">
+                        <span id="replay-speed-value">2x</span>
                     </div>
                     <div class="game-info">
                         <p>Best Game Score: <strong id="best-game-score">-</strong></p>
@@ -72,10 +77,10 @@
                         <button id="live-stop" class="control-btn" disabled>Stop</button>
                         <button id="live-reset" class="control-btn">Reset</button>
                     </div>
-                    <div class="control-row">
+                    <div class="speed-row">
                         <label for="live-speed">Speed:</label>
-                        <input type="range" id="live-speed" min="50" max="1000" value="200" step="50">
-                        <span id="live-speed-value">200ms</span>
+                        <input type="range" id="live-speed" min="1" max="10" value="6" step="1">
+                        <span id="live-speed-value">3x</span>
                     </div>
                     <div class="model-status">
                         <p>Model: <span id="model-status">Loading...</span></p>
