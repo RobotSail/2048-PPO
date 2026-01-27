@@ -420,6 +420,7 @@ def model_optimize_step(
     critic_strength: float = 1.0,
     device: torch.device = None,
     batch_size: int = 32,
+    kl_strength: float = 0.01,
 ):
     """
     Performs an optimization step as part of the RL loop.
@@ -510,13 +511,36 @@ def model_optimize_step(
         importance_ratio = importance_ratio.exp()
         clipped = importance_ratio.clamp(1 - eps, 1 + eps)
         assert advantage.shape == importance_ratio.shape, f"{advantage.shape} != {importance_ratio.shape}"
-        ppo_loss = -torch.minimum(advantage * importance_ratio, advantage * clipped)
+        ppo_clip = torch.minimum(advantage * importance_ratio, advantage * clipped)
         # rho = e^( log(p(old)) - log(p(new)) )
         # L_clip = min(A*rho, clip(rho, 1-eps, 1+eps)*A)
 
         # policy_loss_per_sample = F.cross_entropy(input=masked_action_logits, target=targets, reduction="none")
-        policy_loss_per_sample = ppo_loss
+        policy_loss_per_sample = -ppo_clip
         policy_loss = policy_loss_per_sample.mean()
+        # here we compute KL(old||new)
+        with torch.no_grad():
+            # new policy
+            # new_action_logits, _ = actor_model(
+            #     inputs=input_batch
+            # )
+            new_action_logits, _ = model(input_batch)
+            new_action_logits: torch.Tensor = new_action_logits
+            new_action_logits = torch.masked_fill(new_action_logits, action_mask, float("-inf"))
+
+            # we must compute softmax across the new logits but only
+            # where the moves are valid
+
+            # calculate the probs
+            # new_action_probs = torch.softmax(new_action_logits, dim=1)
+
+            # next we calculate P(old)/P(new)
+            old_probs = torch.masked.softmax(action_logits, mask=~action_mask, dim=1)
+            new_probs = torch.masked.softmax(new_action_logits, dim=1, mask=~action_mask)
+
+            # with logprobs
+
+            per_sample_kl = torch.masked.sum(old_probs * (old_probs / new_probs).log(), dim=1, mask=~action_mask)
 
         # from IPython import embed
         # embed()
@@ -574,6 +598,8 @@ def model_optimize_step(
             # next we calculate P(old)/P(new)
             old_probs = torch.masked.softmax(action_logits, mask=~action_mask, dim=1)
             new_probs = torch.masked.softmax(new_action_logits, dim=1, mask=~action_mask)
+
+            # with logprobs
 
             per_sample_kl = torch.masked.sum(old_probs * (old_probs / new_probs).log(), dim=1, mask=~action_mask)
 
@@ -1507,7 +1533,7 @@ def train(
 
     adamw = AdamW(
         [other_params_1d, value_params_1d],
-        betas=(0.9, 0.999),
+        betas=(0.9, 0.95),
         weight_decay=0.01,
     )
 
