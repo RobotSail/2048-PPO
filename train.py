@@ -426,6 +426,7 @@ def model_optimize_step(
     device: torch.device = None,
     batch_size: int = 32,
     kl_strength: float = 0.01,
+    epochs: int = 1,
 ):
     """
     Performs an optimization step as part of the RL loop.
@@ -453,215 +454,169 @@ def model_optimize_step(
     max_kl = 0.0
     num_batches = 0
 
-    for minibatch in train_loader:
-        # now we create a single batched input tensor
-        input_batch = minibatch["input_batch"]
-        target_batch = minibatch["target_batch"]
-        action_mask = minibatch["action_mask"]
-        advantage = minibatch["advantage"]
-        rtg_batch = minibatch["future_reward"]
-        old_policy_logprobs = minibatch["old_logprobs"]
+    for epoch in range(epochs):
+        for minibatch in train_loader:
+            # now we create a single batched input tensor
+            input_batch = minibatch["input_batch"]
+            target_batch = minibatch["target_batch"]
+            action_mask = minibatch["action_mask"]
+            advantage = minibatch["advantage"]
+            rtg_batch = minibatch["future_reward"]
+            old_policy_logprobs = minibatch["old_logprobs"]
 
-        if device is not None:
-            input_batch = input_batch.to(device)
-            target_batch = target_batch.to(device)
-            action_mask = action_mask.to(device)
-            advantage = advantage.to(device)
-            old_policy_logprobs = old_policy_logprobs.to(device)
+            if device is not None:
+                input_batch = input_batch.to(device)
+                target_batch = target_batch.to(device)
+                action_mask = action_mask.to(device)
+                advantage = advantage.to(device)
+                old_policy_logprobs = old_policy_logprobs.to(device)
 
-        # with torch.no_grad():
-        #     # normalize advantage for more stability during training
-        #     advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+            # with torch.no_grad():
+            #     # normalize advantage for more stability during training
+            #     advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
 
-        # now that the data is prepared, we compute the loss and take an optimizer step
-        # actor_model.train()
-        # critic_model.train()
-        model.train()
+            # now that the data is prepared, we compute the loss and take an optimizer step
+            # actor_model.train()
+            # critic_model.train()
+            model.train()
 
-        # action_logits, _ = actor_model(
-        #     inputs=input_batch,
-        # )
-        # _, value_logits = critic_model(
-        #     inputs=input_batch,
-        # )
-        action_logits, value_logits = model(input_batch)
-
-        targets = target_batch.to(device=action_logits.device)
-
-        # convert (B, 1) into (B, 1)
-        # targets = targets.squeeze(0)
-        masked_action_logits = torch.masked_fill(action_logits, action_mask, float("-inf"))
-
-        # compute the advantaged cross-entropy loss
-        new_policy_logprobs = masked_action_logits.log_softmax(dim=-1)  # (B, T)
-        assert new_policy_logprobs.shape == old_policy_logprobs.shape, (
-            f"{new_policy_logprobs.shape=} == {old_policy_logprobs.shape=}"
-        )
-
-        # next, we need to pluck out the actions taken by the agent in order
-        new_logprobs = torch.gather(
-            new_policy_logprobs,
-            dim=-1,
-            index=targets.unsqueeze(1),  # we want to extend into this direction
-        )
-        old_logprobs = torch.gather(
-            old_policy_logprobs,
-            dim=-1,
-            index=targets.unsqueeze(1),
-        )
-
-        # PPO-clip importance ratio:
-        eps = 0.2
-        importance_ratio = (new_logprobs - old_logprobs).squeeze(1).clamp(-20, 20)
-        importance_ratio = importance_ratio.exp()
-        clipped = importance_ratio.clamp(1 - eps, 1 + eps)
-        assert advantage.shape == importance_ratio.shape, f"{advantage.shape} != {importance_ratio.shape}"
-        ppo_clip = torch.minimum(advantage * importance_ratio, advantage * clipped)
-        # rho = e^( log(p(old)) - log(p(new)) )
-        # L_clip = min(A*rho, clip(rho, 1-eps, 1+eps)*A)
-
-        # policy_loss_per_sample = F.cross_entropy(input=masked_action_logits, target=targets, reduction="none")
-        policy_loss_per_sample = ppo_clip
-        policy_loss = -policy_loss_per_sample.mean()
-        # Print PPO-clip computation stats
-        # print(f"PPO-clip stats:")
-        # print(f"  policy_loss: {policy_loss.item():.4f}")
-        # print(
-        #     f"  new_logprobs: mean={new_logprobs.mean().item():.4f}, min={new_logprobs.min().item():.4f}, max={new_logprobs.max().item():.4f}"
-        # )
-        # print(
-        #     f"  old_logprobs: mean={old_logprobs.mean().item():.4f}, min={old_logprobs.min().item():.4f}, max={old_logprobs.max().item():.4f}"
-        # )
-        # print(
-        #     f"  logprob_diff (new-old): mean={(new_logprobs - old_logprobs).mean().item():.4f}, min={(new_logprobs - old_logprobs).min().item():.4f}, max={(new_logprobs - old_logprobs).max().item():.4f}"
-        # )
-        # print(
-        #     f"  importance_ratio: mean={importance_ratio.mean().item():.4f}, min={importance_ratio.min().item():.4f}, max={importance_ratio.max().item():.4f}"
-        # )
-        # print(
-        #     f"  clipped_ratio: mean={clipped.mean().item():.4f}, min={clipped.min().item():.4f}, max={clipped.max().item():.4f}"
-        # )
-        # print(
-        #     f"  advantage: mean={advantage.mean().item():.4f}, min={advantage.min().item():.4f}, max={advantage.max().item():.4f}"
-        # )
-        # print(
-        #     f"  ppo_clip: mean={ppo_clip.mean().item():.4f}, min={ppo_clip.min().item():.4f}, max={ppo_clip.max().item():.4f}"
-        # )
-        # # from IPython import embed
-
-        # embed()
-        # # here we compute KL(old||new)
-        # with torch.no_grad():
-        #     # new policy
-        #     # new_action_logits, _ = actor_model(
-        #     #     inputs=input_batch
-        #     # )
-        #     new_action_logits, _ = model(input_batch)
-        #     new_action_logits: torch.Tensor = new_action_logits
-        #     new_action_logits = torch.masked_fill(new_action_logits, action_mask, float("-inf"))
-
-        #     # we must compute softmax across the new logits but only
-        #     # where the moves are valid
-
-        #     # calculate the probs
-        #     # new_action_probs = torch.softmax(new_action_logits, dim=1)
-
-        #     # next we calculate P(old)/P(new)
-        #     old_probs = torch.masked.log_softmax(action_logits, mask=~action_mask, dim=-1)
-        #     new_probs = torch.masked.log_softmax(new_action_logits, mask=~action_mask, dim=-1)
-
-        #     # with logprobs
-
-        #     per_sample_kl = torch.masked.sum(old_probs * (old_probs / new_probs).log(), dim=1, mask=~action_mask)
-
-        # from IPython import embed
-        # embed()
-
-        # entropy regularization
-        masked_action_logits_clipped = masked_action_logits.clamp(-20, 20)
-        masked_logprobs = torch.log_softmax(masked_action_logits_clipped, dim=-1)  # contains log(p)
-
-        entropy_per_sample = -torch.masked.sum(masked_logprobs * masked_logprobs.exp(), dim=-1, mask=~action_mask)
-        # entropy_terms = masked_logprobs * masked_logprobs.exp()
-        # entropy_terms = torch.nan_to_num(entropy_terms, nan=0.0)
-        # entropy_per_sample = -entropy_terms.sum(dim=-1)
-
-        entropy_loss = -beta * entropy_per_sample.mean()
-
-        # value loss for the learned baseline
-        value_logits = value_logits.view(-1)
-        value_loss_per_sample = F.smooth_l1_loss(value_logits, rtg_batch, reduction="none")
-        value_loss = critic_strength * value_loss_per_sample.mean()
-
-        # combine all losses
-        loss = policy_loss + entropy_loss + value_loss
-
-        # now we backprop
-        loss.backward()
-        # clip gradnorm and take an optimizer step
-        # actor_grad_norm = torch.nn.utils.clip_grad_norm_(actor_model.parameters(), 1.0)
-        # critic_grad_norm = torch.nn.utils.clip_grad_norm_(critic_model.parameters(), 1.0)
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        # grad_norm = actor_grad_norm + critic_grad_norm
-        # actor_optimizer.step()
-        # critic_optimizer.step()
-        # actor_optimizer.zero_grad()
-        # critic_optimizer.zero_grad()
-        optimizer.step()
-        optimizer.zero_grad()
-        # current_lr = actor_lr_scheduler.get_last_lr()[0] if actor_lr_scheduler is not None else 0.0
-        # critic_current_lr = critic_lr_scheduler.get_last_lr()[0] if critic_lr_scheduler is not None else 0.0
-        # if actor_lr_scheduler is not None:
-        #     actor_lr_scheduler.step()
-        # if critic_lr_scheduler is not None:
-        #     critic_lr_scheduler.step()
-        current_lr = lr_scheduler.get_last_lr()[0] if lr_scheduler is not None else 0.0
-
-        # here we compute KL(old||new)
-        with torch.no_grad():
-            # new policy
-            # new_action_logits, _ = actor_model(
-            #     inputs=input_batch
+            # action_logits, _ = actor_model(
+            #     inputs=input_batch,
             # )
-            new_action_logits, _ = model(input_batch)
-            new_action_logits: torch.Tensor = new_action_logits
-            new_action_logits = torch.masked_fill(new_action_logits, action_mask, float("-inf"))
+            # _, value_logits = critic_model(
+            #     inputs=input_batch,
+            # )
+            action_logits, value_logits = model(input_batch)
 
-            # we must compute softmax across the new logits but only
-            # where the moves are valid
+            targets = target_batch.to(device=action_logits.device)
 
-            # calculate the probs
-            # new_action_probs = torch.softmax(new_action_logits, dim=1)
+            # convert (B, 1) into (B, 1)
+            # targets = targets.squeeze(0)
+            masked_action_logits = torch.masked_fill(action_logits, action_mask, float("-inf"))
 
-            # next we calculate P(old)/P(new)
-            kl_old_logprobs = torch.masked.log_softmax(action_logits, mask=~action_mask, dim=-1)
-            kl_new_logprobs = torch.masked.log_softmax(new_action_logits, mask=~action_mask, dim=-1)
-
-            # with logprobs
-
-            per_sample_kl = torch.masked.sum(
-                kl_old_logprobs.exp() * (kl_old_logprobs - kl_new_logprobs), dim=-1, mask=~action_mask
+            # compute the advantaged cross-entropy loss
+            new_policy_logprobs = masked_action_logits.log_softmax(dim=-1)  # (B, T)
+            assert new_policy_logprobs.shape == old_policy_logprobs.shape, (
+                f"{new_policy_logprobs.shape=} == {old_policy_logprobs.shape=}"
             )
 
-        # Print batch statistics
-        batch_kl = per_sample_kl.mean().item()
-        batch_entropy = entropy_per_sample.mean().item()
-        # print(
-        #     f"Batch {num_batches + 1}: loss={loss.item():.4f}, policy={policy_loss.item():.4f}, "
-        #     f"value={value_loss.item():.4f}, entropy={batch_entropy:.4f}, kl={batch_kl:.4f}, "
-        #     f"grad_norm={grad_norm.item():.4f}"
-        # )
+            # next, we need to pluck out the actions taken by the agent in order
+            new_logprobs = torch.gather(
+                new_policy_logprobs,
+                dim=-1,
+                index=targets.unsqueeze(1),  # we want to extend into this direction
+            )
+            old_logprobs = torch.gather(
+                old_policy_logprobs,
+                dim=-1,
+                index=targets.unsqueeze(1),
+            )
 
-        # Accumulate stats
-        total_loss += loss.detach().cpu().item()
-        total_policy_loss += policy_loss.detach().cpu().item()
-        total_entropy_loss += entropy_loss.detach().cpu().item()
-        total_value_loss += value_loss.detach().cpu().item()
-        total_grad_norm += grad_norm.detach().cpu().item()
-        total_entropy += entropy_per_sample.mean().detach().cpu().item()
-        total_kl += per_sample_kl.sum().detach().cpu().item()
-        max_kl = max(max_kl, per_sample_kl.max().detach().cpu().item())
-        num_batches += 1
+            # PPO-clip importance ratio:
+            eps = 0.2
+            importance_ratio = (new_logprobs - old_logprobs).squeeze(1).clamp(-20, 20)
+            importance_ratio = importance_ratio.exp()
+            clipped = importance_ratio.clamp(1 - eps, 1 + eps)
+            assert advantage.shape == importance_ratio.shape, f"{advantage.shape} != {importance_ratio.shape}"
+            ppo_clip = torch.minimum(advantage * importance_ratio, advantage * clipped)
+            # rho = e^( log(p(old)) - log(p(new)) )
+            # L_clip = min(A*rho, clip(rho, 1-eps, 1+eps)*A)
+
+            # policy_loss_per_sample = F.cross_entropy(input=masked_action_logits, target=targets, reduction="none")
+            policy_loss = -ppo_clip.detach().mean()  # for logs
+
+            # entropy regularization
+            masked_action_logits_clipped = masked_action_logits.clamp(-20, 20)
+            masked_logprobs = torch.log_softmax(masked_action_logits_clipped, dim=-1)  # contains log(p)
+
+            # entropy by definition is negative
+            entropy_per_sample = -torch.masked.sum(masked_logprobs * masked_logprobs.exp(), dim=-1, mask=~action_mask)
+            # entropy_terms = masked_logprobs * masked_logprobs.exp()
+            # entropy_terms = torch.nan_to_num(entropy_terms, nan=0.0)
+            # entropy_per_sample = -entropy_terms.sum(dim=-1)
+
+            # this one is for logs
+            entropy_loss = -beta * entropy_per_sample.detach().mean()
+
+            # value loss for the learned baseline
+            value_logits = value_logits.view(-1)
+            value_loss_per_sample = F.smooth_l1_loss(value_logits, rtg_batch, reduction="none")
+            value_loss = critic_strength * value_loss_per_sample.detach().mean()
+
+            # from IPython import embed
+
+            # embed()
+
+            # here we calculate loss for real
+            unreduced_loss = ppo_clip - critic_strength * value_loss_per_sample + beta * entropy_per_sample
+            loss = -unreduced_loss.mean()
+
+            # now we backprop
+            loss.backward()
+            # clip gradnorm and take an optimizer step
+            # actor_grad_norm = torch.nn.utils.clip_grad_norm_(actor_model.parameters(), 1.0)
+            # critic_grad_norm = torch.nn.utils.clip_grad_norm_(critic_model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # grad_norm = actor_grad_norm + critic_grad_norm
+            # actor_optimizer.step()
+            # critic_optimizer.step()
+            # actor_optimizer.zero_grad()
+            # critic_optimizer.zero_grad()
+            optimizer.step()
+            optimizer.zero_grad()
+            # current_lr = actor_lr_scheduler.get_last_lr()[0] if actor_lr_scheduler is not None else 0.0
+            # critic_current_lr = critic_lr_scheduler.get_last_lr()[0] if critic_lr_scheduler is not None else 0.0
+            # if actor_lr_scheduler is not None:
+            #     actor_lr_scheduler.step()
+            # if critic_lr_scheduler is not None:
+            #     critic_lr_scheduler.step()
+            current_lr = lr_scheduler.get_last_lr()[0] if lr_scheduler is not None else 0.0
+
+            # here we compute KL(old||new)
+            with torch.no_grad():
+                # new policy
+                # new_action_logits, _ = actor_model(
+                #     inputs=input_batch
+                # )
+                new_action_logits, _ = model(input_batch)
+                new_action_logits: torch.Tensor = new_action_logits
+                new_action_logits = torch.masked_fill(new_action_logits, action_mask, float("-inf"))
+
+                # we must compute softmax across the new logits but only
+                # where the moves are valid
+
+                # calculate the probs
+                # new_action_probs = torch.softmax(new_action_logits, dim=1)
+
+                # next we calculate P(old)/P(new)
+                kl_old_logprobs = torch.masked.log_softmax(action_logits, mask=~action_mask, dim=-1)
+                kl_new_logprobs = torch.masked.log_softmax(new_action_logits, mask=~action_mask, dim=-1)
+
+                # with logprobs
+
+                per_sample_kl = torch.masked.sum(
+                    kl_old_logprobs.exp() * (kl_old_logprobs - kl_new_logprobs), dim=-1, mask=~action_mask
+                )
+
+            # Print batch statistics
+            batch_kl = per_sample_kl.mean().item()
+            batch_entropy = entropy_per_sample.mean().item()
+            # print(
+            #     f"Batch {num_batches + 1}: loss={loss.item():.4f}, policy={policy_loss.item():.4f}, "
+            #     f"value={value_loss.item():.4f}, entropy={batch_entropy:.4f}, kl={batch_kl:.4f}, "
+            #     f"grad_norm={grad_norm.item():.4f}"
+            # )
+
+            # Accumulate stats
+            total_loss += loss.detach().cpu().item()
+            total_policy_loss += policy_loss.detach().cpu().item()
+            total_entropy_loss += entropy_loss.detach().cpu().item()
+            total_value_loss += value_loss.detach().cpu().item()
+            total_grad_norm += grad_norm.detach().cpu().item()
+            total_entropy += entropy_per_sample.mean().detach().cpu().item()
+            total_kl += per_sample_kl.sum().detach().cpu().item()
+            max_kl = max(max_kl, per_sample_kl.max().detach().cpu().item())
+            num_batches += 1
 
     # collect averaged stats for logging
     optimizer.scheduler_step()
@@ -1072,6 +1027,7 @@ def compute_batch_stats(
         "kl_max": optimizer_stats.get("kl_max", 0),
         "actor_lr": optimizer_stats.get("actor_lr", 0),
         "critic_lr": optimizer_stats.get("critic_lr", 0),
+        "current_beta": optimizer_stats.get("current_beta", 0),
     }
     return metrics, updated_ema_explained_var
 
@@ -1333,6 +1289,7 @@ def train(
     momentum: float = typer.Option(0.99, "--momentum", help="Momentum used for the EMA of average reward"),
     num_episodes: int = typer.Option(1, "--episodes", help="Number of games to play in a given batch"),
     batch_size: int = typer.Option(1, "--batch-size", help="Minibatch size when updating policy"),
+    ppo_epochs: int = typer.Option(1, "--epochs", help="Number of epochs to train on each batch of rollouts"),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel workers for game execution"),
     max_steps: int = typer.Option(None, "--max-steps", help="Maximum number of steps a game can reach."),
     hidden_size: int = typer.Option(64, "-h", "--hidden", help="hidden capacity of the model"),
@@ -1462,6 +1419,32 @@ def train(
     beta1: float = typer.Option(0.9, "--beta1", help="Beta1 for the AdamW optimizer"),
     beta2: float = typer.Option(0.999, "--beta2", help="Beta2 for the AdamW optimizer"),
     weight_decay: float = typer.Option(0.01, "--weight-decay", help="Weight decay for the AdamW optimizer"),
+    # Adaptive entropy coefficient options
+    adaptive_beta: bool = typer.Option(
+        False,
+        "--adaptive-beta",
+        help="Enable adaptive entropy coefficient that increases when entropy falls below target",
+    ),
+    target_entropy: float = typer.Option(
+        0.7,
+        "--target-entropy",
+        help="Target entropy level to maintain (max entropy for 4 actions is ~1.39)",
+    ),
+    beta_min: float = typer.Option(
+        0.001,
+        "--beta-min",
+        help="Minimum entropy coefficient",
+    ),
+    beta_max: float = typer.Option(
+        1.0,
+        "--beta-max",
+        help="Maximum entropy coefficient",
+    ),
+    beta_lr: float = typer.Option(
+        0.01,
+        "--beta-lr",
+        help="Learning rate for adaptive beta adjustment",
+    ),
 ):
     """Watch the AI play 2048."""
     device = torch.device("cuda:0" if gpu and torch.cuda.is_available() else "cpu")
@@ -1474,6 +1457,7 @@ def train(
         "beta": entropy_strength,
         "critic_strength": critic_strength,
         "batch_size": num_episodes,
+        "ppo_epochs": ppo_epochs,
         "hidden_size": hidden_size,
         "num_layers": num_layers,
         "model_type": model_type,
@@ -1490,6 +1474,11 @@ def train(
         "topological_weight": topological_weight,
         "win_bonus": win_bonus,
         "rtg_beta": rtg_beta,
+        "adaptive_beta": adaptive_beta,
+        "target_entropy": target_entropy,
+        "beta_min": beta_min,
+        "beta_max": beta_max,
+        "beta_lr": beta_lr,
     }
 
     # initialize metric logger
@@ -1655,6 +1644,9 @@ def train(
     ema_pct_2048 = 0.0
     ema_explained_var = 0.0
 
+    # adaptive beta for entropy regularization
+    current_beta = entropy_strength
+
     # helper to get max tile from episode
     def get_max_tile(ep):
         if "final_state" in ep:
@@ -1739,11 +1731,24 @@ def train(
             # actor_lr_scheduler,
             # critic_lr_scheduler,
             None,
-            entropy_strength,
+            current_beta,  # use adaptive beta
             critic_strength,
             device,
             batch_size=batch_size,
+            epochs=ppo_epochs,
         )
+
+        # Adaptive beta adjustment based on entropy
+        if adaptive_beta:
+            current_entropy = stats.get("entropy", target_entropy)
+            # If entropy is below target, increase beta to encourage exploration
+            # If entropy is above target, decrease beta
+            entropy_error = target_entropy - current_entropy
+            current_beta = current_beta * (1.0 + beta_lr * entropy_error)
+            current_beta = max(beta_min, min(beta_max, current_beta))
+
+        # Add current beta to stats for logging
+        stats["current_beta"] = current_beta
 
         # Get highest score from batch and track if we hit a new record
         non_augmented_episodes = [ep for ep in rollout_episodes if not ep.get("augmented", False)]
