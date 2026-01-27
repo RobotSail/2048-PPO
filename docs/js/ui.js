@@ -64,25 +64,30 @@ class UIController {
 
     /**
      * Render a grid state to the board.
+     * @param {number[][]} grid - Grid of values (already 2^exp for replay, exponents for live)
+     * @param {boolean} isExponent - If true, values are exponents and need conversion
      */
-    renderBoard(grid) {
+    renderBoard(grid, isExponent = false) {
         for (let i = 0; i < GRID_SIZE; i++) {
             for (let j = 0; j < GRID_SIZE; j++) {
                 const cell = document.getElementById(`cell-${i}-${j}`);
-                const value = grid[i][j];
+                const rawValue = grid[i][j];
 
-                // Reset classes and set tile class
+                // Convert exponent to actual value if needed
+                const displayValue = isExponent && rawValue > 0 ? Math.pow(2, rawValue) : rawValue;
+
+                // Reset classes and set tile class based on display value
                 cell.className = 'cell';
-                if (value > 0) {
-                    cell.classList.add(`tile-${value}`);
+                if (displayValue > 0) {
+                    cell.classList.add(`tile-${displayValue}`);
                 }
 
-                cell.textContent = value > 0 ? value : '';
+                cell.textContent = displayValue > 0 ? displayValue : '';
 
                 // Adjust font size for large numbers
-                if (value >= 1000) {
+                if (displayValue >= 1000) {
                     cell.style.fontSize = '24px';
-                } else if (value >= 100) {
+                } else if (displayValue >= 100) {
                     cell.style.fontSize = '32px';
                 } else {
                     cell.style.fontSize = '';
@@ -395,7 +400,7 @@ class UIController {
     liveReset() {
         this.liveStop();
         this.game.reset();
-        this.renderBoard(this.game.grid);
+        this.renderBoard(this.game.grid, true);  // Live mode uses exponents
         this.updateScore(0, 0);
         this.updateAction('-');
         this.updateProbabilities([0.25, 0.25, 0.25, 0.25]);
@@ -441,7 +446,7 @@ class UIController {
             const { pointsEarned, done } = this.game.move(action);
 
             // Update display
-            this.renderBoard(this.game.grid);
+            this.renderBoard(this.game.grid, true);  // Live mode uses exponents
             this.updateScore(this.game.score, this.game.moveCount);
             this.updateAction(action, pointsEarned);
 

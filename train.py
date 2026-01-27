@@ -277,6 +277,11 @@ def play_game_for_episode(
             from IPython import embed
 
             embed()
+
+        # print("checking step taken")
+        # from IPython import embed
+
+        # embed()
         # action: Direction = actor_model.directions[selected_action]
         action: Direction = model.directions[selected_action]
 
@@ -506,7 +511,7 @@ def model_optimize_step(
         )
 
         # PPO-clip importance ratio:
-        eps = 0.1
+        eps = 0.2
         importance_ratio = (new_logprobs - old_logprobs).squeeze(1).clamp(-20, 20)
         importance_ratio = importance_ratio.exp()
         clipped = importance_ratio.clamp(1 - eps, 1 + eps)
@@ -516,38 +521,71 @@ def model_optimize_step(
         # L_clip = min(A*rho, clip(rho, 1-eps, 1+eps)*A)
 
         # policy_loss_per_sample = F.cross_entropy(input=masked_action_logits, target=targets, reduction="none")
-        policy_loss_per_sample = -ppo_clip
-        policy_loss = policy_loss_per_sample.mean()
-        # here we compute KL(old||new)
-        with torch.no_grad():
-            # new policy
-            # new_action_logits, _ = actor_model(
-            #     inputs=input_batch
-            # )
-            new_action_logits, _ = model(input_batch)
-            new_action_logits: torch.Tensor = new_action_logits
-            new_action_logits = torch.masked_fill(new_action_logits, action_mask, float("-inf"))
+        policy_loss_per_sample = ppo_clip
+        policy_loss = -policy_loss_per_sample.mean()
+        # Print PPO-clip computation stats
+        # print(f"PPO-clip stats:")
+        # print(f"  policy_loss: {policy_loss.item():.4f}")
+        # print(
+        #     f"  new_logprobs: mean={new_logprobs.mean().item():.4f}, min={new_logprobs.min().item():.4f}, max={new_logprobs.max().item():.4f}"
+        # )
+        # print(
+        #     f"  old_logprobs: mean={old_logprobs.mean().item():.4f}, min={old_logprobs.min().item():.4f}, max={old_logprobs.max().item():.4f}"
+        # )
+        # print(
+        #     f"  logprob_diff (new-old): mean={(new_logprobs - old_logprobs).mean().item():.4f}, min={(new_logprobs - old_logprobs).min().item():.4f}, max={(new_logprobs - old_logprobs).max().item():.4f}"
+        # )
+        # print(
+        #     f"  importance_ratio: mean={importance_ratio.mean().item():.4f}, min={importance_ratio.min().item():.4f}, max={importance_ratio.max().item():.4f}"
+        # )
+        # print(
+        #     f"  clipped_ratio: mean={clipped.mean().item():.4f}, min={clipped.min().item():.4f}, max={clipped.max().item():.4f}"
+        # )
+        # print(
+        #     f"  advantage: mean={advantage.mean().item():.4f}, min={advantage.min().item():.4f}, max={advantage.max().item():.4f}"
+        # )
+        # print(
+        #     f"  ppo_clip: mean={ppo_clip.mean().item():.4f}, min={ppo_clip.min().item():.4f}, max={ppo_clip.max().item():.4f}"
+        # )
+        # # from IPython import embed
 
-            # we must compute softmax across the new logits but only
-            # where the moves are valid
+        # embed()
+        # # here we compute KL(old||new)
+        # with torch.no_grad():
+        #     # new policy
+        #     # new_action_logits, _ = actor_model(
+        #     #     inputs=input_batch
+        #     # )
+        #     new_action_logits, _ = model(input_batch)
+        #     new_action_logits: torch.Tensor = new_action_logits
+        #     new_action_logits = torch.masked_fill(new_action_logits, action_mask, float("-inf"))
 
-            # calculate the probs
-            # new_action_probs = torch.softmax(new_action_logits, dim=1)
+        #     # we must compute softmax across the new logits but only
+        #     # where the moves are valid
 
-            # next we calculate P(old)/P(new)
-            old_probs = torch.masked.softmax(action_logits, mask=~action_mask, dim=1)
-            new_probs = torch.masked.softmax(new_action_logits, dim=1, mask=~action_mask)
+        #     # calculate the probs
+        #     # new_action_probs = torch.softmax(new_action_logits, dim=1)
 
-            # with logprobs
+        #     # next we calculate P(old)/P(new)
+        #     old_probs = torch.masked.log_softmax(action_logits, mask=~action_mask, dim=-1)
+        #     new_probs = torch.masked.log_softmax(new_action_logits, mask=~action_mask, dim=-1)
 
-            per_sample_kl = torch.masked.sum(old_probs * (old_probs / new_probs).log(), dim=1, mask=~action_mask)
+        #     # with logprobs
+
+        #     per_sample_kl = torch.masked.sum(old_probs * (old_probs / new_probs).log(), dim=1, mask=~action_mask)
 
         # from IPython import embed
         # embed()
 
         # entropy regularization
-        masked_probs = torch.masked.softmax(action_logits, dim=1, mask=~action_mask)
-        entropy_per_sample = -torch.masked.sum(masked_probs * (masked_probs + 1e-8).log(), dim=1, mask=~action_mask)
+        masked_action_logits_clipped = masked_action_logits.clamp(-20, 20)
+        masked_logprobs = torch.log_softmax(masked_action_logits_clipped, dim=-1)  # contains log(p)
+
+        entropy_per_sample = -torch.masked.sum(masked_logprobs * masked_logprobs.exp(), dim=-1, mask=~action_mask)
+        # entropy_terms = masked_logprobs * masked_logprobs.exp()
+        # entropy_terms = torch.nan_to_num(entropy_terms, nan=0.0)
+        # entropy_per_sample = -entropy_terms.sum(dim=-1)
+
         entropy_loss = -beta * entropy_per_sample.mean()
 
         # value loss for the learned baseline
@@ -596,12 +634,14 @@ def model_optimize_step(
             # new_action_probs = torch.softmax(new_action_logits, dim=1)
 
             # next we calculate P(old)/P(new)
-            old_probs = torch.masked.softmax(action_logits, mask=~action_mask, dim=1)
-            new_probs = torch.masked.softmax(new_action_logits, dim=1, mask=~action_mask)
+            kl_old_logprobs = torch.masked.log_softmax(action_logits, mask=~action_mask, dim=-1)
+            kl_new_logprobs = torch.masked.log_softmax(new_action_logits, mask=~action_mask, dim=-1)
 
             # with logprobs
 
-            per_sample_kl = torch.masked.sum(old_probs * (old_probs / new_probs).log(), dim=1, mask=~action_mask)
+            per_sample_kl = torch.masked.sum(
+                kl_old_logprobs.exp() * (kl_old_logprobs - kl_new_logprobs), dim=-1, mask=~action_mask
+            )
 
         # Print batch statistics
         batch_kl = per_sample_kl.mean().item()
@@ -817,6 +857,14 @@ def calculate_advantage(
                 new_mask[new_idx] = mask[old_idx]
             return new_mask
 
+        def remap_policy_logprobs(logprobs: list[float], remap_fn, *args) -> list[float]:
+            """Remap policy logprobs using the same direction remapping."""
+            new_logprobs = [0.0] * 4
+            for old_idx in range(4):
+                new_idx = remap_fn(old_idx, *args)
+                new_logprobs[new_idx] = logprobs[old_idx]
+            return new_logprobs
+
         for step in sampled_steps:
             # chance of mirroring
             if random.random() < 0.5:
@@ -839,6 +887,11 @@ def calculate_advantage(
 
                 old_mask = augmented_step.pop("action_mask", [False] * 4)
                 augmented_step["action_mask"] = remap_action_mask(old_mask, remap_direction_mirror, mirror_axis)
+
+                old_logprobs = augmented_step.pop("policy_logprobs", [0.0] * 4)
+                augmented_step["policy_logprobs"] = remap_policy_logprobs(
+                    old_logprobs, remap_direction_mirror, mirror_axis
+                )
 
                 augmented_steps.append(augmented_step)
 
@@ -863,6 +916,9 @@ def calculate_advantage(
 
                 old_mask = augmented_step.pop("action_mask", [False] * 4)
                 augmented_step["action_mask"] = remap_action_mask(old_mask, remap_direction_rotate, degrees)
+
+                old_logprobs = augmented_step.pop("policy_logprobs", [0.0] * 4)
+                augmented_step["policy_logprobs"] = remap_policy_logprobs(old_logprobs, remap_direction_rotate, degrees)
 
                 augmented_steps.append(augmented_step)
 
@@ -996,6 +1052,7 @@ def compute_batch_stats(
         "reward_var": reward_var,
         "reward_mean": reward_mean,
         "zero_reward_pct": zero_reward_pct,
+        "advantage_mean": adv_mean,
         "advantage_var": adv_var,
         "advantage_l2": adv_l2_norm,
         "adv_min": min(advantages),
@@ -1402,6 +1459,9 @@ def train(
         "--checkpoint-dir",
         help="Directory to save model checkpoints",
     ),
+    beta1: float = typer.Option(0.9, "--beta1", help="Beta1 for the AdamW optimizer"),
+    beta2: float = typer.Option(0.999, "--beta2", help="Beta2 for the AdamW optimizer"),
+    weight_decay: float = typer.Option(0.01, "--weight-decay", help="Weight decay for the AdamW optimizer"),
 ):
     """Watch the AI play 2048."""
     device = torch.device("cuda:0" if gpu and torch.cuda.is_available() else "cpu")
@@ -1533,11 +1593,11 @@ def train(
 
     adamw = AdamW(
         [other_params_1d, value_params_1d],
-        betas=(0.9, 0.95),
-        weight_decay=0.01,
+        betas=(beta1, beta2),
+        weight_decay=weight_decay,
     )
 
-    muon = Muon([other_params_2d, value_params_2d], adjust_lr_fn="match_rms_adamw", weight_decay=0.01)
+    muon = Muon([other_params_2d, value_params_2d], adjust_lr_fn="match_rms_adamw", weight_decay=weight_decay)
     adamw_scheduler = get_scheduler(
         "cosine",
         adamw,
