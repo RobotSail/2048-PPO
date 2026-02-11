@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 from game import Game2048, Direction, GameMLP, MLPConfig, GameURM, GameURMConfig, Grid
 from logger import MetricLogger
+from batched_rollout import play_games_batched
 
 
 def export_model_to_onnx(model: torch.nn.Module, output_path: str, config: MLPConfig) -> None:
@@ -421,11 +422,10 @@ def model_optimize_step(
     # actor_lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
     # critic_lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
-    beta: float = 0.1,
+    kl_strength: float = 0.1,
     critic_strength: float = 1.0,
     device: torch.device = None,
     batch_size: int = 32,
-    kl_strength: float = 0.01,
     epochs: int = 1,
 ):
     """
@@ -451,6 +451,7 @@ def model_optimize_step(
     total_grad_norm = 0.0
     total_entropy = 0.0
     total_kl = 0.0
+    avg_kl = 0.0
     max_kl = 0.0
     num_batches = 0
 
@@ -469,6 +470,7 @@ def model_optimize_step(
                 target_batch = target_batch.to(device)
                 action_mask = action_mask.to(device)
                 advantage = advantage.to(device)
+                rtg_batch = rtg_batch.to(device)
                 old_policy_logprobs = old_policy_logprobs.to(device)
 
             # with torch.no_grad():
@@ -536,7 +538,7 @@ def model_optimize_step(
             # entropy_per_sample = -entropy_terms.sum(dim=-1)
 
             # this one is for logs
-            entropy_loss = -beta * entropy_per_sample.detach().mean()
+            entropy_loss = -kl_strength * entropy_per_sample.detach().mean()
 
             # value loss for the learned baseline
             value_logits = value_logits.view(-1)
@@ -548,7 +550,7 @@ def model_optimize_step(
             # embed()
 
             # here we calculate loss for real
-            unreduced_loss = ppo_clip - critic_strength * value_loss_per_sample + beta * entropy_per_sample
+            unreduced_loss = ppo_clip - critic_strength * value_loss_per_sample + kl_strength * entropy_per_sample
             loss = -unreduced_loss.mean()
 
             # now we backprop
@@ -615,6 +617,7 @@ def model_optimize_step(
             total_grad_norm += grad_norm.detach().cpu().item()
             total_entropy += entropy_per_sample.mean().detach().cpu().item()
             total_kl += per_sample_kl.sum().detach().cpu().item()
+            avg_kl += per_sample_kl.mean().detach().cpu().item()
             max_kl = max(max_kl, per_sample_kl.max().detach().cpu().item())
             num_batches += 1
 
@@ -629,8 +632,8 @@ def model_optimize_step(
         # "critic_grad_norm": critic_grad_norm.detach().cpu().item(),
         "grad_norm": total_grad_norm / num_batches,
         "entropy": total_entropy / num_batches,
-        "kl_total": total_kl,
-        "kl_average": total_kl / num_batches,
+        "kl_total": total_kl / num_batches,
+        "kl_average": avg_kl / num_batches,
         "kl_max": max_kl,
         # "actor_lr": current_lr,
         # "critic_lr": critic_current_lr,
@@ -966,6 +969,11 @@ def compute_batch_stats(
         else (scores[len(scores) // 2 - 1] + scores[len(scores) // 2]) / 2
     )
 
+    # Calculate average episode return by capturing G_0 (future_reward_raw at first timestep) for non-augmented episodes
+    non_augmented_episodes = [ep for ep in rollout_episodes if not ep.get("augmented", False)]
+    episode_returns = [ep["moves"][0]["future_reward_raw"] for ep in non_augmented_episodes if ep["moves"]]
+    avg_episode_return = sum(episode_returns) / len(episode_returns) if episode_returns else 0.0
+
     adv_l2_norm = sum(a**2 for a in advantages) ** 0.5
     future_norm_std = future_norm_var**0.5
     adv_std = adv_var**0.5
@@ -998,6 +1006,7 @@ def compute_batch_stats(
         "avg_score": avg_score,
         "ema_avg_score": ema_avg_score,
         "median_score": median_score,
+        "avg_episode_return": avg_episode_return,
         "pct_512": batch_pct_512,
         "ema_pct_512": ema_pct_512,
         "pct_1024": batch_pct_1024,
@@ -1030,7 +1039,6 @@ def compute_batch_stats(
         "current_beta": optimizer_stats.get("current_beta", 0),
     }
     return metrics, updated_ema_explained_var
-
 
 def print_episode_breakdown(
     logger,
@@ -1653,36 +1661,26 @@ def train(
             return max(2**cell if cell > 0 else 0 for row in ep["final_state"] for cell in row)
         return 0
 
+    # Batched rollout flag (use batched inference when num_episodes > 1)
+    use_batched = num_episodes > 1
+    if use_batched:
+        logger.print(f"Using batched rollout for {num_episodes} games per step")
+
     for train_step in tqdm(range(steps), desc=f"Running RL training"):
         # actor_model.eval()
         # critic_model.eval()
         model.eval()
 
         # here we compute a single pass
-        rollout_episodes = []
-
-        # game loop - parallel if workers > 1
-        if workers > 1:
-            raise NotImplementedError("multithreading is not implemented")
-            # # Prepare args for worker processes (state dict, config, max_steps)
-            # state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
-            # config_dict = {
-            #     "hidden_dim": hidden_size,
-            #     "num_layers": num_layers,
-            #     "dropout": 0.0,  # dropout not used at inference
-            # }
-            # worker_args = [
-            #     (state_dict, config_dict, max_steps) for _ in range(batch_size)
-            # ]
-
-            # with ProcessPoolExecutor(max_workers=workers) as executor:
-            #     rollout_episodes = list(executor.map(_worker_play_game, worker_args))
+        # Use batched rollout (vectorized, single process, batched inference)
+        if use_batched:
+            rollout_episodes = play_games_batched(
+                model, num_games=num_episodes, max_steps=max_steps, device=device
+            )
         else:
-            for _ in range(num_episodes):
-                rollout_episodes.append(
-                    # play_game_for_episode(actor_model, critic_model, max_steps=max_steps, device=device)
-                    play_game_for_episode(model, max_steps=max_steps, device=device)
-                )
+            rollout_episodes = [
+                play_game_for_episode(model, max_steps=max_steps, device=device)
+            ]
 
         # rollout_episodes.extend(augment_data_samples(rollout_episodes, upsample_ratio))
 
@@ -1723,17 +1721,17 @@ def train(
         stats = model_optimize_step(
             # actor_model,
             # critic_model,
-            model,
-            rollout_episodes,
+            model=model,
+            episodes=rollout_episodes,
             # actor_optimizer,
             # critic_optimizer,
-            optimizer,
+            optimizer=optimizer,
             # actor_lr_scheduler,
             # critic_lr_scheduler,
-            None,
-            current_beta,  # use adaptive beta
-            critic_strength,
-            device,
+            lr_scheduler=None,
+            kl_strength=current_beta,  # use adaptive beta
+            critic_strength=critic_strength,
+            device=device,
             batch_size=batch_size,
             epochs=ppo_epochs,
         )
@@ -1971,6 +1969,8 @@ def export_demo_cmd(
         "-n",
         help="Number of games to play to find best game (if --game not provided)",
     ),
+    gpu: bool = typer.Option(False, "--gpu", help="Use CUDA:0 for batched inference"),
+    batch_size: int = typer.Option(32, "--batch-size", "-b", help="Number of games to play in parallel per batch"),
 ):
     """
     Export trained model and best game to docs/ for GitHub Pages demo.
@@ -1979,6 +1979,8 @@ def export_demo_cmd(
         python train.py export-demo --model checkpoints/best_model.pt
         python train.py export-demo --model checkpoints/best_model.pt --game viz_data/step_001000.json
     """
+    device = torch.device("cuda:0" if gpu and torch.cuda.is_available() else "cpu")
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2001,7 +2003,8 @@ def export_demo_cmd(
     model = GameMLP(config)
     model.load_state_dict(state_dict)
     model.eval()
-    typer.echo(f"Model loaded (hidden_dim={config.hidden_dim}, num_layers={config.num_layers})")
+    model = model.to(device)
+    typer.echo(f"Model loaded (hidden_dim={config.hidden_dim}, num_layers={config.num_layers}, device={device})")
 
     # Get best game
     if game_path and game_path.exists():
@@ -2022,26 +2025,33 @@ def export_demo_cmd(
                 json.dump(demo_data, f, indent=2)
             typer.echo(f"Game exported to {output_game_path}")
     else:
-        # Play games to find best one
-        typer.echo(f"Playing {num_games} games to find best game...")
-        best_episode = None
-        best_score = 0
+        # Play games in batches for speed + progress visibility
+        batch_sz = min(batch_size, num_games)
+        typer.echo(f"Playing {num_games} games in batches of {batch_sz} (device={device})...")
+        episodes = []
+        for i in tqdm(range(0, num_games, batch_sz), desc="Playing games"):
+            chunk = min(batch_sz, num_games - i)
+            episodes.extend(play_games_batched(model, num_games=chunk, max_steps=None, device=device))
 
-        for i in tqdm(range(num_games), desc="Playing games"):
-            episode = play_game_for_episode(model, max_steps=None, device=None)
-            if episode["total_points"] > best_score:
-                best_score = episode["total_points"]
-                best_episode = episode
+        # Print summary stats
+        scores = sorted([ep["total_points"] for ep in episodes], reverse=True)
+        avg_score = sum(scores) / len(scores)
+        max_tiles = [max(2**c if c > 0 else 0 for row in ep["final_state"] for c in row) for ep in episodes]
+        typer.echo(f"Played {num_games} games — avg: {avg_score:.0f}, best: {scores[0]}, worst: {scores[-1]}")
+        typer.echo(f"Max tiles reached: {sorted(set(max_tiles), reverse=True)}")
+
+        best_episode = max(episodes, key=lambda ep: ep["total_points"])
 
         if best_episode:
             export_best_game_for_demo(best_episode, str(output_dir / "best_game.json"))
         else:
             typer.echo("Warning: No games were played successfully")
 
-    # Export model to ONNX
+    # Export model to ONNX (must be on CPU)
     try:
+        model_cpu = model.cpu()
         onnx_path = output_dir / "model.onnx"
-        export_model_to_onnx(model, str(onnx_path), config)
+        export_model_to_onnx(model_cpu, str(onnx_path), config)
         typer.echo(f"Model exported to {onnx_path}")
     except ImportError as e:
         typer.echo(f"Error: Missing dependency - {e}")
